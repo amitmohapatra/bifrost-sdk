@@ -47,6 +47,8 @@ _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 #: HTTP boundaries this client reasons about.
 _ERROR = 400  # at or above: the gateway reported a problem
 _RATE_LIMITED = 429
+#: How much of an error body to carry on the exception, for logs and debugging.
+_BODY_EXCERPT = 500
 _SERVER_ERROR = 500  # at or above: the gateway itself is unwell, so ping() says no
 
 
@@ -412,16 +414,24 @@ class Bifrost:
 
     @staticmethod
     def _error(response: httpx.Response) -> Exception:
-        body = response.text[:500]
+        # Parse the whole body, carry a bounded slice. These were one variable, and the
+        # truncation silently ate the rate-limit advice for the one provider that puts it in
+        # the body: Gemini's quota reply is 751 characters with "Please retry in 28.9s." at
+        # index 483, so a 500-character slice cut it at "Please retry in 8" — no trailing
+        # "s", no match, no delay. The client then fell back to a backoff of half a second
+        # against a window of half a minute and gave up in eight, which looked from the
+        # outside like a gateway that would not serve us rather than one asking us to wait.
+        body = response.text
+        excerpt = body[:_BODY_EXCERPT]
         if response.status_code == _RATE_LIMITED:
             return RateLimited(
                 "gateway rate limited the request",
                 retry_after=retry_after(response.headers, body),
                 status=_RATE_LIMITED,
-                body=body,
+                body=excerpt,
             )
         return GatewayError(
-            f"gateway returned {response.status_code}", status=response.status_code, body=body
+            f"gateway returned {response.status_code}", status=response.status_code, body=excerpt
         )
 
     @staticmethod

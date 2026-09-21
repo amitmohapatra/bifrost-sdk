@@ -589,3 +589,72 @@ async def test_a_routing_header_is_sent_verbatim() -> None:
     await bf.call().header(**{"x-tier": "batch"}).chat("go")
     assert sent["x-tier"] == "batch"
     await bf.aclose()
+
+
+def test_the_delay_is_read_from_a_real_gemini_quota_body() -> None:
+    """Captured from the live gateway, not written from the documentation.
+
+    Gemini answers 429 with the delay in the *body* and no ``Retry-After`` header at all.
+    A client that reads only the header sees nothing, falls back to an exponential backoff
+    measured in milliseconds, and spends its whole retry budget inside a window measured in
+    seconds — which is how a rate limit becomes a failed request instead of a slow one.
+    """
+    captured = (
+        "You exceeded your current quota, please check your plan and billing details. "
+        "For more information on this error, head to: "
+        "https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, "
+        "head to: https://ai.dev/rate-limit. \n"
+        "* Quota exceeded for metric: "
+        "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+        "limit: 20, model: gemini-3.6-flash\n"
+        "Please retry in 8.586631853s."
+    )
+
+    assert retry_after(None, captured) == pytest.approx(8.586631853)
+    # An explicit header still wins: it is the protocol's answer, the body is a fallback.
+    assert retry_after({"retry-after": "30"}, captured) == 30.0
+    # And a body with no advice must not invent a delay.
+    assert retry_after(None, "You exceeded your current quota.") is None
+
+
+async def test_a_long_rate_limit_body_still_yields_its_delay() -> None:
+    """The delay must survive the excerpt the exception carries.
+
+    Captured verbatim from the gateway: 751 characters, with the advice at index 483. The
+    error body used to be truncated to 500 characters *before* it was parsed, which cut
+    "Please retry in 28.9s." at "Please retry in 8" — no trailing "s", so no match, so no
+    delay. The client then waited half a second against a window of half a minute and gave
+    up, which looks from the outside like a gateway that will not serve you rather than one
+    asking you to come back shortly.
+    """
+    body = (
+        '{"is_bifrost_error":false,"status_code":429,"error":{"type":"RESOURCE_EXHAUSTED",'
+        '"code":"429","message":"You exceeded your current quota, please check your plan and '
+        "billing details. For more information on this error, head to: "
+        "https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, "
+        "head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: "
+        "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, "
+        'model: gemini-3.6-flash\\nPlease retry in 28.973095374s."}}'
+    )
+    assert len(body) > 500, "the point of this test is a body longer than the excerpt"
+    assert body.index("Please retry in") > 400, "and advice that lands past the cut"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text=body)
+
+    client = Bifrost(
+        "http://gateway/v1",
+        model="gemini/gemini-3.6-flash",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
+        ),
+        max_retries=0,
+    )
+    with pytest.raises(RateLimited) as raised:
+        await client.chat("hello")
+
+    assert raised.value.retry_after == pytest.approx(28.973095374)
+    # The exception still carries only an excerpt: parsing everything is not a licence to
+    # attach an unbounded body to an error that ends up in logs.
+    assert len(raised.value.details["body"]) <= 500
+    await client.aclose()
