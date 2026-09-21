@@ -49,7 +49,6 @@ _ERROR = 400  # at or above: the gateway reported a problem
 _RATE_LIMITED = 429
 #: How much of an error body to carry on the exception, for logs and debugging.
 _BODY_EXCERPT = 500
-_SERVER_ERROR = 500  # at or above: the gateway itself is unwell, so ping() says no
 
 
 def _origin(base_url: str) -> str:
@@ -325,12 +324,24 @@ class Bifrost:
     # ----------------------------------------------------------------- lifecycle
 
     async def ping(self) -> bool:
-        """Whether the gateway answers. Never raises."""
+        """Whether this is a gateway we can actually use. Never raises.
+
+        Success, not merely "answered". It used to accept anything below 500, which makes
+        the check unable to fail in the one case it exists for: a ``base_url`` pointing at
+        something that is not this gateway. That is not hypothetical — the default here is
+        ``localhost:8090/v1``, and on the machine this was written on a *different* service
+        held port 8090 and answered 404, so a misconfigured deployment reported its model
+        dependency healthy and failed on every actual call.
+
+        A 401 or 404 on ``/models`` means the same request to ``/chat/completions``, which
+        is all this client ever sends, will not work either. Reporting that as up is worse
+        than reporting nothing.
+        """
         try:
             response = await self._client.get("/models", timeout=5.0)
         except httpx.HTTPError:
             return False
-        return response.status_code < _SERVER_ERROR
+        return response.is_success
 
     async def aclose(self) -> None:
         if self._owns_client:

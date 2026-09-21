@@ -10,9 +10,9 @@ local model by changing a string.
 from bifrost_sdk import Bifrost
 
 async with Bifrost("http://gateway:8080/v1", model="gemini/gemini-3.6-flash") as bf:
-    text = await bf.chat("summarise this")                    # -> str
+    text = await bf.chat("summarise this")  # -> str
     data = await bf.json("extract the fields", schema=SCHEMA)  # -> dict
-    async for delta in bf.stream("write a story"):             # -> AsyncIterator[str]
+    async for delta in bf.stream("write a story"):  # -> AsyncIterator[str]
         print(delta, end="")
 ```
 

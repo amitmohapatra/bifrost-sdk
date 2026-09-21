@@ -658,3 +658,60 @@ async def test_a_long_rate_limit_body_still_yields_its_delay() -> None:
     # attach an unbounded body to an error that ends up in logs.
     assert len(raised.value.details["body"]) <= 500
     await client.aclose()
+
+
+# ------------------------------------------------- ping means usable, not merely answering
+
+
+@pytest.mark.parametrize(
+    ("status", "usable", "why"),
+    [
+        (200, True, "the gateway listed its models"),
+        (404, False, "something is there, but /models is not it"),
+        (401, False, "reachable and refusing us — every call will refuse too"),
+        (500, False, "the gateway itself is unwell"),
+        (503, False, "the gateway is unwell"),
+    ],
+)
+async def test_ping_reports_a_gateway_we_can_actually_use(
+    status: int, usable: bool, why: str
+) -> None:
+    """It used to accept anything below 500, which makes the check unable to fail in the
+    one case it exists for: a base_url pointing at something that is not this gateway.
+
+    Not hypothetical — the default is localhost:8090/v1, and on the machine this was
+    written on a different service held 8090 and answered 404. A deployment pointed there
+    reported its model dependency healthy and failed on every actual call. In
+    agent-memory-service that value feeds /health/ready and the dependency_up gauge.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        return httpx.Response(status)
+
+    client = Bifrost(
+        "http://gateway/v1",
+        model="m",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
+        ),
+    )
+    assert await client.ping() is usable, why
+    await client.aclose()
+
+
+async def test_an_unreachable_gateway_pings_false_rather_than_raising() -> None:
+    """Readiness calls this in a loop; it must never be the thing that breaks the probe."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nothing listening")
+
+    client = Bifrost(
+        "http://gateway/v1",
+        model="m",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
+        ),
+    )
+    assert await client.ping() is False
+    await client.aclose()
