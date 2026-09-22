@@ -11,7 +11,15 @@ import json as jsonlib
 import httpx
 import pytest
 
-from bifrost_sdk import Bifrost, EmptyResponse, GatewayError, InvalidJSON, RateLimited, Unreachable
+from bifrost_sdk import (
+    Bifrost,
+    CircuitOpen,
+    EmptyResponse,
+    GatewayError,
+    InvalidJSON,
+    RateLimited,
+    Unreachable,
+)
 from bifrost_sdk._headers import Options
 from bifrost_sdk._retry import retry_after
 
@@ -715,3 +723,91 @@ async def test_an_unreachable_gateway_pings_false_rather_than_raising() -> None:
     )
     assert await client.ping() is False
     await client.aclose()
+
+
+# --------------------------------------------------------------------- breaker
+#
+# The breaker used to live in the memory service's LLM adapter and in the harness's model
+# client, as the same thirty lines twice. These are the behaviours both of them had to get
+# right, asserted once.
+
+
+def _boom(status: int = 500):
+    """A handler that always fails, counting how many requests actually reached it."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(status, json={"error": "boom"})
+
+    return handler, calls
+
+
+async def test_the_breaker_opens_and_stops_sending() -> None:
+    handler, calls = _boom()
+    bf = client(handler, max_retries=0, circuit_failure_threshold=2, circuit_open_seconds=60.0)
+    for _ in range(2):
+        with pytest.raises(GatewayError):
+            await bf.chat("hi")
+    assert calls["n"] == 2
+    with pytest.raises(CircuitOpen) as caught:
+        await bf.chat("hi")
+    assert calls["n"] == 2, "an open circuit must not reach the transport"
+    assert 0 < caught.value.retry_after <= 60.0
+    assert caught.value.details["retry_after_seconds"] == caught.value.retry_after
+
+
+async def test_rate_limits_do_not_open_the_breaker() -> None:
+    """17 rate limits once opened the circuit; the next 62 calls sent nothing at all."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, text="Please retry in 0.01s")
+
+    bf = client(handler, max_retries=0, circuit_failure_threshold=2, circuit_open_seconds=60.0)
+    for _ in range(5):
+        with pytest.raises(RateLimited):
+            await bf.chat("hi")
+    assert calls["n"] == 5, "backpressure is not an outage"
+    assert bf.breaker.consecutive_failures == 0
+
+
+async def test_one_success_closes_the_breaker_again() -> None:
+    state = {"fail": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if state["fail"]:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+        )
+
+    bf = client(handler, max_retries=0, circuit_failure_threshold=3)
+    with pytest.raises(GatewayError):
+        await bf.chat("hi")
+    assert bf.breaker.consecutive_failures == 1
+    state["fail"] = False
+    assert await bf.chat("hi") == "ok"
+    assert bf.breaker.consecutive_failures == 0
+
+
+async def test_a_spent_retry_budget_counts_once_not_once_per_attempt() -> None:
+    """Otherwise a threshold of 5 with 2 retries opens after two calls, not five."""
+    handler, calls = _boom(503)
+    bf = client(handler, max_retries=2, backoff_seconds=0.0, circuit_failure_threshold=5)
+    for _ in range(2):
+        with pytest.raises(GatewayError):
+            await bf.chat("hi")
+    assert calls["n"] == 6, "two calls, three attempts each"
+    assert bf.breaker.consecutive_failures == 2
+    assert not bf.breaker.is_open
+
+
+async def test_threshold_zero_disables_the_breaker() -> None:
+    handler, calls = _boom()
+    bf = client(handler, max_retries=0, circuit_failure_threshold=0)
+    for _ in range(4):
+        with pytest.raises(GatewayError):
+            await bf.chat("hi")
+    assert calls["n"] == 4

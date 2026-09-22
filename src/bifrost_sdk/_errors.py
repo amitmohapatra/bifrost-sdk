@@ -34,6 +34,18 @@ class GatewayError(BifrostError):
     """The gateway answered with an error status."""
 
 
+class CircuitOpen(BifrostError):
+    """The breaker is open: recent calls failed, so this one was not sent.
+
+    ``retry_after`` is how many seconds are left on the open circuit. Deliberately not a
+    :class:`GatewayError` — nothing was asked of the gateway, so nothing it said applies.
+    """
+
+    def __init__(self, message: str, *, retry_after: float = 0.0, **details: Any) -> None:
+        super().__init__(message, retry_after_seconds=retry_after, **details)
+        self.retry_after = retry_after
+
+
 class EmptyResponse(BifrostError):
     """The model returned no text.
 

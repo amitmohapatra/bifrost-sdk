@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._call import Call
 from bifrost_sdk._errors import (
     EmptyResponse,
@@ -87,6 +88,8 @@ class Bifrost:
         max_retries: int = 2,
         backoff_seconds: float = 0.5,
         max_tokens: int = 2048,
+        circuit_failure_threshold: int = 5,
+        circuit_open_seconds: float = 30.0,
         client: httpx.AsyncClient | None = None,
         admin_token: str | None = None,
         admin_client: httpx.AsyncClient | None = None,
@@ -97,6 +100,10 @@ class Bifrost:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
+        #: Retries handle one bad call; the breaker handles a bad gateway. Without it an
+        #: outage costs one full timeout *per request* — with it, one in total. Pass
+        #: ``circuit_failure_threshold=0`` to turn it off and see every failure yourself.
+        self.breaker = Breaker(circuit_failure_threshold, circuit_open_seconds)
         headers = {"Content-Type": "application/json"}
         if api_key:
             # A gateway virtual key, never a provider key: the provider's credential stays in
@@ -402,6 +409,7 @@ class Bifrost:
             request["timeout"] = timeout
         if options is not None and (extra := options.headers()):
             request["headers"] = extra
+        self.breaker.check()
         error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             wait = backoff(attempt, self.backoff_seconds)
@@ -412,15 +420,23 @@ class Bifrost:
             else:
                 if response.status_code < _ERROR:
                     try:
-                        return dict(response.json())
+                        payload = dict(response.json())
                     except ValueError as exc:
+                        # A 200 the caller cannot use is still the gateway misbehaving.
+                        self.breaker.record_failure()
                         raise GatewayError("gateway returned a non-JSON body") from exc
+                    self.breaker.record_success()
+                    return payload
                 error = self._error(response)
                 if response.status_code not in RETRYABLE:
+                    self.breaker.record_failure(error)
                     raise error
                 wait = getattr(error, "retry_after", None) or wait
             if attempt < self.max_retries:
                 await asyncio.sleep(min(wait, 60.0))
+        # The retries are spent. This counts once, not once per attempt: the breaker
+        # measures failed *calls*, and a threshold of 5 would otherwise open after two.
+        self.breaker.record_failure(error)
         raise error or GatewayError("request failed")
 
     @staticmethod

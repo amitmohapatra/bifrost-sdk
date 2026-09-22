@@ -17,10 +17,12 @@ visible, bill a customer, keep a turn out of the logs — is a chain:
 The gateway holds the provider keys; this client knows a URL and a model name.
 """
 
+from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._call import Call
 from bifrost_sdk._client import Bifrost, Messages
 from bifrost_sdk._errors import (
     BifrostError,
+    CircuitOpen,
     EmptyResponse,
     GatewayError,
     InvalidJSON,
@@ -34,7 +36,9 @@ __all__ = [
     "RETRYABLE",
     "Bifrost",
     "BifrostError",
+    "Breaker",
     "Call",
+    "CircuitOpen",
     "EmptyResponse",
     "GatewayError",
     "InvalidJSON",
