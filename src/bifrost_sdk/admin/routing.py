@@ -15,36 +15,36 @@ from __future__ import annotations
 
 from typing import Any
 
-from bifrost_sdk.resources._base import Resource, unwrap
+from bifrost_sdk._api import Resource
 
 
 class Routing(Resource):
-    """``bf.routing`` — stored routing rules and the complexity analyzer."""
+    """``admin.routing`` — stored routing rules and the complexity analyzer."""
 
     async def rules(self, **filters: Any) -> list[dict[str, Any]]:
-        return list(unwrap(await self._get("/api/routing/rules", **filters), "rules") or [])
+        return await self._api.items("/api/routing/rules", ("rules",), **filters)
 
     async def add_rule(self, **rule: Any) -> dict[str, Any]:
         """Create a routing rule. The matching half is a CEL expression."""
-        return await self._post("/api/routing/rules", rule)
+        return await self._api.post("/api/routing/rules", rule)
 
     async def update_rule(self, rule_id: str, **changes: Any) -> dict[str, Any]:
-        return await self._put(f"/api/routing/rules/{rule_id}", changes)
+        return await self._api.put(f"/api/routing/rules/{rule_id}", changes)
 
     async def delete_rule(self, rule_id: str) -> None:
-        await self._delete(f"/api/routing/rules/{rule_id}")
+        await self._api.delete(f"/api/routing/rules/{rule_id}")
 
     # ------------------------------------------------------------------ complexity
     async def complexity_config(self) -> dict[str, Any]:
-        return await self._get("/api/routing/complexity-analyzer-config")
+        return await self._api.get("/api/routing/complexity-analyzer-config")
 
     async def set_complexity_config(self, **config: Any) -> dict[str, Any]:
-        return await self._put("/api/routing/complexity-analyzer-config", config)
+        return await self._api.put("/api/routing/complexity-analyzer-config", config)
 
     async def complexity_status(self) -> dict[str, Any]:
         """Whether the analyzer is ready. It warms asynchronously, and a rule that
         references ``complexity_tier`` before it is ready evaluates on an unknown value."""
-        return await self._get("/api/routing/complexity-analyzer-status")
+        return await self._api.get("/api/routing/complexity-analyzer-status")
 
 
 __all__ = ["Routing"]

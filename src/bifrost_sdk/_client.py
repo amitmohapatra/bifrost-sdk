@@ -23,45 +23,27 @@ import json as jsonlib
 import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
+from bifrost_sdk._api import CONNECT_TIMEOUT, ManagementAPI, management_client
 from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._errors import (
+    ERROR_STATUS,
     EmptyResponse,
     GatewayError,
     InvalidJSON,
-    RateLimited,
-    Unreachable,
+    from_response,
+    unreachable,
 )
-from bifrost_sdk._retry import RETRYABLE, backoff, retry_after
+from bifrost_sdk._mcp import MCP
+from bifrost_sdk._retry import RETRYABLE, backoff
 from bifrost_sdk.headers import Options
-from bifrost_sdk.resources import MCP, Governance, Prompts, Routing, Skills, VirtualKeys
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
-
-#: HTTP boundaries this client reasons about.
-_ERROR = 400  # at or above: the gateway reported a problem
-_RATE_LIMITED = 429
-#: How much of an error body to carry on the exception, for logs and debugging.
-_BODY_EXCERPT = 500
-
-
-def _origin(base_url: str) -> str:
-    """The scheme+host of a gateway URL, dropping the ``/v1`` (or any) path suffix."""
-    parsed = urlsplit(base_url)
-    return f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else base_url.rstrip("/")
-
-
-def _admin_headers(token: str | None) -> dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
 
 
 def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
@@ -112,27 +94,14 @@ class Bifrost:
         self._client = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers=headers,
-            timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
+            timeout=httpx.Timeout(timeout, connect=min(CONNECT_TIMEOUT, timeout)),
         )
         self._owns_client = client is None
-        #: Management routes live at ``/api/*`` — a sibling of the ``/v1`` inference base,
-        #: not a child of it — and they authenticate with a bearer token rather than the
-        #: virtual key inference uses. A second httpx client rooted at the origin is the
-        #: honest way to say that; sticking "../api" on the inference base works until
-        #: someone deploys the gateway under a path prefix.
-        self._admin = admin_client or httpx.AsyncClient(
-            base_url=_origin(base_url),
-            headers=_admin_headers(admin_token or api_key),
-            timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
-        )
+        #: ``/api/*`` (MCP listing, logs, client CRUD) authenticates with a bearer token,
+        #: defaulting to the virtual key.
+        self._admin = admin_client or management_client(base_url, admin_token or api_key, timeout)
         self._owns_admin = admin_client is None
-
-        self.mcp = MCP(self)
-        self.prompts = Prompts(self)
-        self.skills = Skills(self)
-        self.vk = VirtualKeys(self)
-        self.governance = Governance(self)
-        self.routing = Routing(self)
+        self.mcp = MCP(ManagementAPI(self._admin))
 
     # ----------------------------------------------------------------- the three verbs
 
@@ -223,9 +192,9 @@ class Bifrost:
             async with self._client.stream(
                 "POST", "/chat/completions", json=body, headers=headers
             ) as response:
-                if response.status_code >= _ERROR:
+                if response.status_code >= ERROR_STATUS:
                     await response.aread()
-                    raise self._error(response)
+                    raise from_response(response)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -235,8 +204,8 @@ class Bifrost:
                     delta = _delta(data)
                     if delta:
                         yield delta
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise Unreachable(f"gateway unreachable ({type(exc).__name__})") from exc
+        except httpx.TransportError as exc:
+            raise unreachable(exc) from exc
 
     # ----------------------------------------------------------------- the raw payload
 
@@ -305,10 +274,10 @@ class Bifrost:
             request["timeout"] = timeout
         try:
             response = await self._client.post("/mcp/tool/execute", **request)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise Unreachable(f"gateway unreachable ({type(exc).__name__})") from exc
-        if response.status_code >= _ERROR:
-            raise self._error(response)
+        except httpx.TransportError as exc:
+            raise unreachable(exc) from exc
+        if response.status_code >= ERROR_STATUS:
+            raise from_response(response)
         try:
             return dict(response.json())
         except ValueError as exc:
@@ -401,10 +370,10 @@ class Bifrost:
             wait = backoff(attempt, self.backoff_seconds)
             try:
                 response = await self._client.post("/chat/completions", **request)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                error = Unreachable(f"gateway unreachable ({type(exc).__name__})")
+            except httpx.TransportError as exc:
+                error = unreachable(exc)
             else:
-                if response.status_code < _ERROR:
+                if response.status_code < ERROR_STATUS:
                     try:
                         payload = dict(response.json())
                     except ValueError as exc:
@@ -413,7 +382,7 @@ class Bifrost:
                         raise GatewayError("gateway returned a non-JSON body") from exc
                     self._breaker.record_success()
                     return payload
-                error = self._error(response)
+                error = from_response(response)
                 if response.status_code not in RETRYABLE:
                     self._breaker.record_failure(error)
                     raise error
@@ -424,28 +393,6 @@ class Bifrost:
         # measures failed *calls*, and a threshold of 5 would otherwise open after two.
         self._breaker.record_failure(error)
         raise error or GatewayError("request failed")
-
-    @staticmethod
-    def _error(response: httpx.Response) -> Exception:
-        # Parse the whole body, carry a bounded slice. These were one variable, and the
-        # truncation silently ate the rate-limit advice for the one provider that puts it in
-        # the body: Gemini's quota reply is 751 characters with "Please retry in 28.9s." at
-        # index 483, so a 500-character slice cut it at "Please retry in 8" — no trailing
-        # "s", no match, no delay. The client then fell back to a backoff of half a second
-        # against a window of half a minute and gave up in eight, which looked from the
-        # outside like a gateway that would not serve us rather than one asking us to wait.
-        body = response.text
-        excerpt = body[:_BODY_EXCERPT]
-        if response.status_code == _RATE_LIMITED:
-            return RateLimited(
-                "gateway rate limited the request",
-                retry_after=retry_after(response.headers, body),
-                status=_RATE_LIMITED,
-                body=excerpt,
-            )
-        return GatewayError(
-            f"gateway returned {response.status_code}", status=response.status_code, body=excerpt
-        )
 
     @staticmethod
     def _text(payload: dict[str, Any]) -> str:

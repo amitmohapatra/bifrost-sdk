@@ -4,6 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
+from bifrost_sdk._retry import retry_after
+
+#: At or above this status the gateway reported a problem.
+ERROR_STATUS = 400
+_RATE_LIMITED = 429
+#: How much of an error body to carry on the exception, for logs and debugging.
+_BODY_EXCERPT = 500
+
 
 class BifrostError(Exception):
     """Base class. ``details`` carries whatever the gateway said, for logs and tests."""
@@ -58,3 +68,28 @@ class EmptyResponse(BifrostError):
 
 class InvalidJSON(BifrostError):
     """``json()`` asked for structured output and could not parse what came back."""
+
+
+def unreachable(exc: httpx.TransportError) -> Unreachable:
+    """A transport failure (connect, timeout, protocol) as this client's error."""
+    return Unreachable(f"gateway unreachable ({type(exc).__name__})")
+
+
+def from_response(response: httpx.Response) -> RateLimited | GatewayError:
+    """The error an error-status response means.
+
+    The whole body is parsed and only an excerpt carried: Gemini's quota reply puts
+    "Please retry in 28.9s." at index 483 of 751, so truncating before parsing lost the delay.
+    """
+    body = response.text
+    excerpt = body[:_BODY_EXCERPT]
+    if response.status_code == _RATE_LIMITED:
+        return RateLimited(
+            "gateway rate limited the request",
+            retry_after=retry_after(response.headers, body),
+            status=_RATE_LIMITED,
+            body=excerpt,
+        )
+    return GatewayError(
+        f"gateway returned {response.status_code}", status=response.status_code, body=excerpt
+    )

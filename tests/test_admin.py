@@ -1,9 +1,7 @@
-"""The management namespaces: routes, unwrapping, and the deny-by-default trap.
+"""``bifrost_sdk.admin``: routes, unwrapping, and the deny-by-default trap.
 
-Every path asserted here was read out of Bifrost's Go route table, not guessed. An earlier
-version of this client shipped a ``tools()`` method against an endpoint that does not exist,
-which returned the SPA's HTML and failed as a JSON parse error — these tests are what stops
-that being possible twice.
+Every path asserted here was read out of Bifrost's route table, not guessed: an unknown
+``/api`` path answers 200 with the UI's HTML, so a wrong route fails late and confusingly.
 """
 
 from __future__ import annotations
@@ -13,18 +11,15 @@ import json as jsonlib
 import httpx
 import pytest
 
-from bifrost_sdk import Bifrost, GatewayError
+from bifrost_sdk import GatewayError, Unreachable
+from bifrost_sdk.admin import Admin
 
-BASE = "http://gateway.test/v1"
 
-
-def client(handler) -> Bifrost:
+def client(handler) -> Admin:
     transport = httpx.MockTransport(handler)
-    return Bifrost(
-        BASE,
-        model="test/model",
-        client=httpx.AsyncClient(transport=transport, base_url=BASE),
-        admin_client=httpx.AsyncClient(transport=transport, base_url="http://gateway.test"),
+    return Admin(
+        "http://gateway.test",
+        client=httpx.AsyncClient(transport=transport, base_url="http://gateway.test"),
     )
 
 
@@ -39,41 +34,6 @@ def record(payload, status=200):
         return httpx.Response(status, json=payload)
 
     return seen, handler
-
-
-# ----------------------------------------------------------------- mcp
-
-
-async def test_mcp_clients_are_unwrapped_from_their_envelope() -> None:
-    seen, handler = record({"clients": [{"name": "memory"}], "count": 1})
-    bf = client(handler)
-    assert await bf.mcp.clients() == [{"name": "memory"}]
-    assert (seen["method"], seen["path"]) == ("GET", "/api/mcp/clients")
-    await bf.aclose()
-
-
-async def test_registering_a_server_posts_the_documented_shape() -> None:
-    seen, handler = record({"id": "c1"})
-    bf = client(handler)
-    await bf.mcp.add("memory", connection_type="http", connection_string="http://mcp:8200/mcp")
-    assert (seen["method"], seen["path"]) == ("POST", "/api/mcp/client")
-    assert seen["body"] == {
-        "name": "memory",
-        "connection_type": "http",
-        "connection_string": "http://mcp:8200/mcp",
-    }
-    await bf.aclose()
-
-
-async def test_mcp_execute_goes_through_the_inference_client_not_the_admin_one() -> None:
-    """Tool execution is a ``/v1`` route and must inherit the inference retry policy: a tool
-    call failing on a 503 should be retried exactly like the completion that asked for it."""
-    seen, handler = record({"role": "tool", "content": "42", "tool_call_id": "t1"})
-    bf = client(handler)
-    turn = await bf.mcp.execute({"id": "t1", "function": {"name": "answer", "arguments": "{}"}})
-    assert turn["content"] == "42"
-    assert seen["path"].endswith("/mcp/tool/execute")
-    await bf.aclose()
 
 
 # ----------------------------------------------------------------- prompts / skills
@@ -133,10 +93,10 @@ async def test_a_key_carries_its_provider_and_mcp_allow_lists() -> None:
     await bf.vk.create(
         "triage-agent",
         provider_configs=[{"provider": "gemini", "allowed_models": ["gemini-3.6-flash"]}],
-        mcp_configs=[{"mcp_client_name": "memory", "tools_to_execute": ["memory.recall"]}],
+        mcp_configs=[{"mcp_client_name": "memory", "tools_to_execute": ["recall"]}],
     )
     assert seen["body"]["provider_configs"][0]["provider"] == "gemini"
-    assert seen["body"]["mcp_configs"][0]["tools_to_execute"] == ["memory.recall"]
+    assert seen["body"]["mcp_configs"][0]["tools_to_execute"] == ["recall"]
     await bf.aclose()
 
 
@@ -182,5 +142,34 @@ async def test_a_delete_returning_no_content_is_not_an_error() -> None:
         return httpx.Response(204)
 
     bf = client(handler)
-    assert await bf.mcp.remove("c1") is None
+    assert await bf.skills.delete("s1") is None
     await bf.aclose()
+
+
+async def test_an_unreachable_gateway_says_so() -> None:
+    def handler(request):
+        raise httpx.ConnectError("refused")
+
+    bf = client(handler)
+    with pytest.raises(Unreachable):
+        await bf.routing.rules()
+    await bf.aclose()
+
+
+def test_the_origin_is_derived_from_a_v1_url() -> None:
+    admin = Admin("http://gateway.test:8080/v1", token="t")
+    assert str(admin._http.base_url) == "http://gateway.test:8080"
+    assert admin._http.headers["Authorization"] == "Bearer t"
+
+
+def test_a_base_url_is_required() -> None:
+    with pytest.raises(ValueError, match="base_url"):
+        Admin("")
+
+
+async def test_admin_closes_only_the_client_it_created() -> None:
+    external = httpx.AsyncClient()
+    async with Admin("http://gateway.test", client=external):
+        pass
+    assert not external.is_closed
+    await external.aclose()

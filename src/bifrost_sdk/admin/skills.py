@@ -9,29 +9,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from bifrost_sdk.resources._base import Resource, unwrap
+from bifrost_sdk._api import Resource
 
 
 class Skills(Resource):
-    """``bf.skills`` — the skills repository."""
+    """``admin.skills`` — the skills repository."""
 
     async def list(self, **filters: Any) -> list[dict[str, Any]]:
-        return list(unwrap(await self._get("/api/skills", **filters), "skills") or [])
+        return await self._api.items("/api/skills", ("skills",), **filters)
 
     async def get(self, skill_id: str) -> dict[str, Any]:
-        return await self._get(f"/api/skills/{skill_id}")
+        return await self._api.get(f"/api/skills/{skill_id}")
 
     async def create(self, name: str, **fields: Any) -> dict[str, Any]:
-        return await self._post("/api/skills", {"name": name, **fields})
+        return await self._api.post("/api/skills", {"name": name, **fields})
 
     async def update(self, skill_id: str, **changes: Any) -> dict[str, Any]:
-        return await self._put(f"/api/skills/{skill_id}", changes)
+        return await self._api.put(f"/api/skills/{skill_id}", changes)
 
     async def delete(self, skill_id: str) -> None:
-        await self._delete(f"/api/skills/{skill_id}")
+        await self._api.delete(f"/api/skills/{skill_id}")
 
     async def versions(self, skill_id: str) -> list[dict[str, Any]]:
-        return list(unwrap(await self._get(f"/api/skills/{skill_id}/versions"), "versions") or [])
+        return await self._api.items(f"/api/skills/{skill_id}/versions", ("versions",))
 
     async def shift_version(self, skill_id: str, version: str) -> dict[str, Any]:
         """Change which published version is *served*, without publishing a new one.
@@ -39,7 +39,7 @@ class Skills(Resource):
         The rollback path: serving is decoupled from publishing, so a bad skill version is
         undone by pointing at the previous one rather than by re-uploading it.
         """
-        return await self._post(f"/api/skills/{skill_id}/shift-version", {"version": version})
+        return await self._api.post(f"/api/skills/{skill_id}/shift-version", {"version": version})
 
 
 __all__ = ["Skills"]
