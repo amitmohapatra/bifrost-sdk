@@ -41,27 +41,27 @@ def record(payload, status=200):
 
 async def test_prompt_versions_use_the_nested_route() -> None:
     seen, handler = record({"versions": [{"version": 3}]})
-    bf = client(handler)
-    assert await bf.prompts.versions("p-1") == [{"version": 3}]
+    admin = client(handler)
+    assert await admin.prompts.versions("p-1") == [{"version": 3}]
     assert seen["path"] == "/api/prompt-repo/prompts/p-1/versions"
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_skill_version_shift_is_a_post_not_an_update() -> None:
     """Serving is decoupled from publishing: rollback points at an existing version."""
     seen, handler = record({"served": "1.2.0"})
-    bf = client(handler)
-    await bf.skills.shift_version("s-1", "1.2.0")
+    admin = client(handler)
+    await admin.skills.shift_version("s-1", "1.2.0")
     assert (seen["method"], seen["path"]) == ("POST", "/api/skills/s-1/shift-version")
     assert seen["body"] == {"version": "1.2.0"}
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_a_list_endpoint_without_an_envelope_still_works() -> None:
     _seen, handler = record([{"id": "s1"}])
-    bf = client(handler)
-    assert await bf.skills.list() == [{"id": "s1"}]
-    await bf.aclose()
+    admin = client(handler)
+    assert await admin.skills.list() == [{"id": "s1"}]
+    await admin.aclose()
 
 
 # ----------------------------------------------------------------- governance
@@ -69,10 +69,10 @@ async def test_a_list_endpoint_without_an_envelope_still_works() -> None:
 
 async def test_quota_is_the_route_a_key_may_call_about_itself() -> None:
     seen, handler = record({"remaining": 12.5})
-    bf = client(handler)
-    assert await bf.vk.quota() == {"remaining": 12.5}
+    admin = client(handler)
+    assert await admin.vk.quota() == {"remaining": 12.5}
     assert seen["path"] == "/api/governance/virtual-keys/quota"
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_creating_a_key_without_configs_permits_nothing() -> None:
@@ -80,34 +80,34 @@ async def test_creating_a_key_without_configs_permits_nothing() -> None:
     a permissive default. A key created bare fails on first use, and that has to be the
     caller's visible decision rather than a surprise."""
     seen, handler = record({"id": "vk1"})
-    bf = client(handler)
-    await bf.vk.create("triage-agent")
+    admin = client(handler)
+    await admin.vk.create("triage-agent")
     assert seen["body"] == {"name": "triage-agent"}
     assert "provider_configs" not in seen["body"]
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_a_key_carries_its_provider_and_mcp_allow_lists() -> None:
     seen, handler = record({"id": "vk1"})
-    bf = client(handler)
-    await bf.vk.create(
+    admin = client(handler)
+    await admin.vk.create(
         "triage-agent",
         provider_configs=[{"provider": "gemini", "allowed_models": ["gemini-3.6-flash"]}],
         mcp_configs=[{"mcp_client_name": "memory", "tools_to_execute": ["recall"]}],
     )
     assert seen["body"]["provider_configs"][0]["provider"] == "gemini"
     assert seen["body"]["mcp_configs"][0]["tools_to_execute"] == ["recall"]
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_bulk_rotate_and_single_rotate_use_different_routes() -> None:
     seen, handler = record({"rotated": 1})
-    bf = client(handler)
-    await bf.vk.rotate("vk1")
+    admin = client(handler)
+    await admin.vk.rotate("vk1")
     assert seen["path"] == "/api/governance/virtual-keys/vk1/rotate"
-    await bf.vk.rotate()
+    await admin.vk.rotate()
     assert seen["path"] == "/api/governance/virtual-keys/rotate"
-    await bf.aclose()
+    await admin.aclose()
 
 
 # ----------------------------------------------------------------- failure modes
@@ -120,40 +120,40 @@ async def test_an_html_body_is_reported_as_a_bad_body_not_a_parse_crash() -> Non
     def handler(request):
         return httpx.Response(200, text="<!doctype html><html>…", headers={})
 
-    bf = client(handler)
+    admin = client(handler)
     with pytest.raises(GatewayError, match="non-JSON body"):
-        await bf.prompts.list()
-    await bf.aclose()
+        await admin.prompts.list()
+    await admin.aclose()
 
 
 async def test_an_error_status_keeps_its_code() -> None:
     def handler(request):
         return httpx.Response(403, text="forbidden")
 
-    bf = client(handler)
+    admin = client(handler)
     with pytest.raises(GatewayError) as caught:
-        await bf.vk.list()
+        await admin.vk.list()
     assert caught.value.details["status"] == 403
-    await bf.aclose()
+    await admin.aclose()
 
 
 async def test_a_delete_returning_no_content_is_not_an_error() -> None:
     def handler(request):
         return httpx.Response(204)
 
-    bf = client(handler)
-    assert await bf.skills.delete("s1") is None
-    await bf.aclose()
+    admin = client(handler)
+    assert await admin.skills.delete("s1") is None
+    await admin.aclose()
 
 
 async def test_an_unreachable_gateway_says_so() -> None:
     def handler(request):
         raise httpx.ConnectError("refused")
 
-    bf = client(handler)
+    admin = client(handler)
     with pytest.raises(Unreachable):
-        await bf.routing.rules()
-    await bf.aclose()
+        await admin.routing.rules()
+    await admin.aclose()
 
 
 def test_the_origin_is_derived_from_a_v1_url() -> None:
