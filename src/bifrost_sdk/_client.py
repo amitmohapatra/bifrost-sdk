@@ -28,7 +28,6 @@ from urllib.parse import urlsplit
 import httpx
 
 from bifrost_sdk._breaker import Breaker
-from bifrost_sdk._call import Call
 from bifrost_sdk._errors import (
     EmptyResponse,
     GatewayError,
@@ -36,8 +35,8 @@ from bifrost_sdk._errors import (
     RateLimited,
     Unreachable,
 )
-from bifrost_sdk._headers import Options
 from bifrost_sdk._retry import RETRYABLE, backoff, retry_after
+from bifrost_sdk.headers import Options
 from bifrost_sdk.resources import MCP, Governance, Prompts, Routing, Skills, VirtualKeys
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
@@ -73,9 +72,10 @@ def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
 class Bifrost:
     """One gateway, one default model, three verbs.
 
-    Everything below the public methods exists because a real gateway did it to us: rate
-    limits that carry their delay in the body, reasoning models that answer with nothing, and
-    a circuit breaker that must not confuse "slow down" with "broken".
+    Every verb takes ``options=`` (:class:`~bifrost_sdk.headers.Options`) for per-request
+    gateway behaviour. Everything below the public methods exists because a real gateway did
+    it to us: rate limits that carry their delay in the body, reasoning models that answer
+    with nothing, and a circuit breaker that must not confuse "slow down" with "broken".
     """
 
     def __init__(
@@ -103,7 +103,7 @@ class Bifrost:
         #: Retries handle one bad call; the breaker handles a bad gateway. Without it an
         #: outage costs one full timeout *per request* — with it, one in total. Pass
         #: ``circuit_failure_threshold=0`` to turn it off and see every failure yourself.
-        self.breaker = Breaker(circuit_failure_threshold, circuit_open_seconds)
+        self._breaker = Breaker(circuit_failure_threshold, circuit_open_seconds)
         headers = {"Content-Type": "application/json"}
         if api_key:
             # A gateway virtual key, never a provider key: the provider's credential stays in
@@ -145,7 +145,7 @@ class Bifrost:
         max_tokens: int | None = None,
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
-        _options: Options | None = None,
+        options: Options | None = None,
         **extra: Any,
     ) -> str:
         """The model's reply, as text."""
@@ -158,7 +158,7 @@ class Bifrost:
             tools=tools,
             extra=extra,
         )
-        return self._text(await self._post(body, options=_options))
+        return self._text(await self._post(body, options=options))
 
     async def json(
         self,
@@ -168,7 +168,7 @@ class Bifrost:
         model: str | None = None,
         system: str | None = None,
         max_tokens: int | None = None,
-        _options: Options | None = None,
+        options: Options | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """The model's reply, parsed as an object.
@@ -189,7 +189,7 @@ class Bifrost:
                 "type": "json_schema",
                 "json_schema": {"name": "response", "schema": schema, "strict": True},
             }
-        return _parse_json(self._text(await self._post(body, options=_options)))
+        return _parse_json(self._text(await self._post(body, options=options)))
 
     async def stream(
         self,
@@ -200,7 +200,7 @@ class Bifrost:
         max_tokens: int | None = None,
         temperature: float = 0.0,
         tools: list[dict[str, Any]] | None = None,
-        _options: Options | None = None,
+        options: Options | None = None,
         **extra: Any,
     ) -> AsyncIterator[str]:
         """Text deltas, yielded as they arrive.
@@ -219,7 +219,7 @@ class Bifrost:
             extra=extra,
         ) | {"stream": True}
         try:
-            headers = _options.headers() if _options is not None else None
+            headers = options.headers() if options is not None else None
             async with self._client.stream(
                 "POST", "/chat/completions", json=body, headers=headers
             ) as response:
@@ -253,7 +253,7 @@ class Bifrost:
         # httpx's own transport timeout, which fails the request retryably instead of
         # cancelling the caller mid-await.
         timeout: float | None = None,  # noqa: ASYNC109
-        _options: Options | None = None,
+        options: Options | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """The gateway's response object, verbatim.
@@ -275,21 +275,7 @@ class Bifrost:
             tools=tools,
             extra=extra,
         )
-        return await self._post(body, timeout=timeout, options=_options)
-
-    # ----------------------------------------------------------------- building a call
-
-    def using(self, model: str) -> Call:
-        """Start a chained call on a specific model."""
-        return Call(self, model=model).using(model)
-
-    def prompt(self, prompt_id: str, *, version: int | None = None) -> Call:
-        """Start a chained call that injects a stored prompt from the repository."""
-        return Call(self, model=self.model).prompt(prompt_id, version=version)
-
-    def call(self) -> Call:
-        """An empty chain, for when the first thing you set is not the model or prompt."""
-        return Call(self, model=self.model)
+        return await self._post(body, timeout=timeout, options=options)
 
     # ----------------------------------------------------------------- MCP tools
 
@@ -409,7 +395,7 @@ class Bifrost:
             request["timeout"] = timeout
         if options is not None and (extra := options.headers()):
             request["headers"] = extra
-        self.breaker.check()
+        self._breaker.check()
         error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             wait = backoff(attempt, self.backoff_seconds)
@@ -423,20 +409,20 @@ class Bifrost:
                         payload = dict(response.json())
                     except ValueError as exc:
                         # A 200 the caller cannot use is still the gateway misbehaving.
-                        self.breaker.record_failure()
+                        self._breaker.record_failure()
                         raise GatewayError("gateway returned a non-JSON body") from exc
-                    self.breaker.record_success()
+                    self._breaker.record_success()
                     return payload
                 error = self._error(response)
                 if response.status_code not in RETRYABLE:
-                    self.breaker.record_failure(error)
+                    self._breaker.record_failure(error)
                     raise error
                 wait = getattr(error, "retry_after", None) or wait
             if attempt < self.max_retries:
                 await asyncio.sleep(min(wait, 60.0))
         # The retries are spent. This counts once, not once per attempt: the breaker
         # measures failed *calls*, and a threshold of 5 would otherwise open after two.
-        self.breaker.record_failure(error)
+        self._breaker.record_failure(error)
         raise error or GatewayError("request failed")
 
     @staticmethod

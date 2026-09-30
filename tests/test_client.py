@@ -20,8 +20,8 @@ from bifrost_sdk import (
     RateLimited,
     Unreachable,
 )
-from bifrost_sdk._headers import Options
 from bifrost_sdk._retry import retry_after
+from bifrost_sdk.headers import Options
 
 BASE = "http://gateway.test/v1"
 
@@ -452,7 +452,7 @@ async def test_an_unreachable_gateway_is_not_reported_as_a_tool_failure() -> Non
     await bf.aclose()
 
 
-# ----------------------------------------------------------------- the fluent chain
+# ----------------------------------------------------------------- per-request options
 
 
 def _capture():
@@ -460,30 +460,34 @@ def _capture():
 
     def handler(request):
         seen["headers"] = {k: v for k, v in request.headers.items() if k.startswith("x-bf-")}
+        seen["all_headers"] = dict(request.headers)
         seen["body"] = jsonlib.loads(request.content) if request.content else {}
         return reply("ok")
 
     return seen, handler
 
 
-async def test_a_chain_sends_every_option_as_its_gateway_header() -> None:
-    """One expression, one request: prompt, MCP scope, session, customer and model."""
+async def test_options_send_every_field_as_its_gateway_header() -> None:
     seen, handler = _capture()
     bf = client(handler)
-    await (
-        bf.prompt("p-123", version=3)
-        .mcp(clients=["memory"], tools=["memory.recall"])
-        .session("thread-9")
-        .customer(id="acme", name="Acme Industrial")
-        .dimensions(team="payments")
-        .using("gemini/gemini-3.6-flash")
-        .chat("what changed?")
+    options = Options(
+        prompt_id="p-123",
+        prompt_version=3,
+        mcp_clients=["memory"],
+        mcp_tools=["memory-recall"],
+        parent_request_id="run-1",
+        session_id="thread-9",
+        customer_id="acme",
+        customer_name="Acme Industrial",
+        dimensions={"team": "payments"},
     )
+    await bf.chat("what changed?", model="gemini/gemini-3.6-flash", options=options)
     assert seen["headers"] == {
         "x-bf-prompt-id": "p-123",
         "x-bf-prompt-version": "3",
         "x-bf-mcp-include-clients": "memory",
-        "x-bf-mcp-include-tools": "memory.recall",
+        "x-bf-mcp-include-tools": "memory-recall",
+        "x-bf-parent-request-id": "run-1",
         "x-bf-session-id": "thread-9",
         "x-bf-customer-id": "acme",
         "x-bf-customer-name": "Acme Industrial",
@@ -493,29 +497,8 @@ async def test_a_chain_sends_every_option_as_its_gateway_header() -> None:
     await bf.aclose()
 
 
-async def test_each_step_returns_a_new_call_so_a_template_is_reusable() -> None:
-    """A half-built chain is what a harness keeps per agent and finishes per turn. If a step
-    mutated in place, the second turn would inherit the first turn's session."""
-    seen, handler = _capture()
-    bf = client(handler)
-    base = bf.prompt("p-1").mcp(clients=["memory"])
-    first = base.session("thread-a")
-    second = base.session("thread-b")
-
-    assert base is not first and first is not second
-    await first.chat("one")
-    assert seen["headers"]["x-bf-session-id"] == "thread-a"
-    await second.chat("two")
-    assert seen["headers"]["x-bf-session-id"] == "thread-b"
-    # the template itself never acquired a session
-    await base.chat("three")
-    assert "x-bf-session-id" not in seen["headers"]
-    await bf.aclose()
-
-
-async def test_a_plain_call_sends_no_gateway_headers_at_all() -> None:
-    """Unset options must send nothing: an empty header is not the same as absent, and the
-    gateway treats some of these as present-means-on."""
+async def test_no_options_sends_no_gateway_headers_at_all() -> None:
+    """An empty header is not the same as an absent one: for MCP scope it means deny-all."""
     seen, handler = _capture()
     bf = client(handler)
     await bf.chat("hi")
@@ -523,15 +506,38 @@ async def test_a_plain_call_sends_no_gateway_headers_at_all() -> None:
     await bf.aclose()
 
 
+def test_an_empty_mcp_scope_is_sent_as_deny_all_and_none_as_absent() -> None:
+    """Verified against the gateway: absent = unscoped, present-and-empty = nothing."""
+    assert Options().headers() == {}
+    assert Options(mcp_clients=[], mcp_tools=()).headers() == {
+        "x-bf-mcp-include-clients": "",
+        "x-bf-mcp-include-tools": "",
+    }
+    assert Options(mcp_tools=["erp-*", "crm-find"]).headers() == {
+        "x-bf-mcp-include-tools": "erp-*,crm-find"
+    }
+
+
+def test_options_are_immutable_and_merge_into_a_copy() -> None:
+    clients = ["memory"]
+    base = Options(mcp_clients=clients)
+    clients.append("erp")
+    assert base.mcp_clients == ("memory",), "a caller's list cannot change a built Options"
+    merged = base.merged(session_id="s-1")
+    assert merged is not base
+    assert base.session_id is None
+    assert merged.headers()["x-bf-session-id"] == "s-1"
+
+
 async def test_private_opts_out_of_content_logging() -> None:
     seen, handler = _capture()
     bf = client(handler)
-    await bf.call().private().chat("my card number is ...")
+    await bf.chat("my card number is ...", options=Options(content_logging=False))
     assert seen["headers"] == {"x-bf-disable-content-logging": "true"}
     await bf.aclose()
 
 
-async def test_a_prompt_version_never_travels_without_its_prompt() -> None:
+def test_a_prompt_version_never_travels_without_its_prompt() -> None:
     """Version alone selects nothing and looks like the prompt was ignored."""
     assert Options(prompt_version=4).headers() == {}
     assert Options(prompt_id="p", prompt_version=4).headers() == {
@@ -540,7 +546,7 @@ async def test_a_prompt_version_never_travels_without_its_prompt() -> None:
     }
 
 
-async def test_the_chain_reaches_every_terminal_verb() -> None:
+async def test_options_reach_every_verb() -> None:
     seen, handler = _capture()
 
     def json_handler(request):
@@ -548,18 +554,18 @@ async def test_the_chain_reaches_every_terminal_verb() -> None:
         return reply('{"ok": true}')
 
     bf = client(json_handler)
-    chained = bf.call().session("s-1")
-    assert await chained.chat("a") == '{"ok": true}'
+    options = Options(session_id="s-1")
+    assert await bf.chat("a", options=options) == '{"ok": true}'
     assert seen["headers"]["x-bf-session-id"] == "s-1"
-    assert await chained.json("b") == {"ok": True}
+    assert await bf.json("b", options=options) == {"ok": True}
     assert seen["headers"]["x-bf-session-id"] == "s-1"
-    payload = await chained.complete("c")
-    assert payload["choices"][0]["message"]["content"] == '{"ok": true}'
+    await bf.complete("c", options=options)
     assert seen["headers"]["x-bf-session-id"] == "s-1"
+    assert "options" not in seen["body"], "options are headers, never body keys"
     await bf.aclose()
 
 
-async def test_streaming_carries_the_chain_too() -> None:
+async def test_streaming_carries_options_too() -> None:
     seen: dict[str, object] = {}
 
     def handler(request):
@@ -568,34 +574,20 @@ async def test_streaming_carries_the_chain_too() -> None:
         return httpx.Response(200, text=body)
 
     bf = client(handler)
-    deltas = [d async for d in bf.call().session("s-2").mcp(clients=["memory"]).stream("go")]
+    options = Options(session_id="s-2", mcp_clients=["memory"])
+    deltas = [d async for d in bf.stream("go", options=options)]
     assert deltas == ["hi"]
     assert seen["headers"]["x-bf-session-id"] == "s-2"
     assert seen["headers"]["x-bf-mcp-include-clients"] == "memory"
     await bf.aclose()
 
 
-async def test_arbitrary_headers_reach_the_gateway_for_routing_rules() -> None:
-    """Routing rules are CEL over a caller-supplied ``headers`` map, so anything set here is
-    a routing input — not just the typed x-bf-* options."""
+async def test_a_routing_header_is_sent_verbatim() -> None:
+    """Routing rules are CEL over a caller-supplied ``headers`` map."""
     seen, handler = _capture()
     bf = client(handler)
-    await bf.call().header(**{"x-tier": "batch"}).dimensions(team="payments").chat("go")
-    assert seen["headers"]["x-bf-dim-team"] == "payments"
-    await bf.aclose()
-    assert True
-
-
-async def test_a_routing_header_is_sent_verbatim() -> None:
-    sent: dict[str, object] = {}
-
-    def handler(request):
-        sent["x-tier"] = request.headers.get("x-tier")
-        return reply("ok")
-
-    bf = client(handler)
-    await bf.call().header(**{"x-tier": "batch"}).chat("go")
-    assert sent["x-tier"] == "batch"
+    await bf.chat("go", options=Options(extra={"x-tier": "batch"}))
+    assert seen["all_headers"]["x-tier"] == "batch"
     await bf.aclose()
 
 
@@ -770,7 +762,7 @@ async def test_rate_limits_do_not_open_the_breaker() -> None:
         with pytest.raises(RateLimited):
             await bf.chat("hi")
     assert calls["n"] == 5, "backpressure is not an outage"
-    assert bf.breaker.consecutive_failures == 0
+    assert bf._breaker.consecutive_failures == 0
 
 
 async def test_one_success_closes_the_breaker_again() -> None:
@@ -786,10 +778,10 @@ async def test_one_success_closes_the_breaker_again() -> None:
     bf = client(handler, max_retries=0, circuit_failure_threshold=3)
     with pytest.raises(GatewayError):
         await bf.chat("hi")
-    assert bf.breaker.consecutive_failures == 1
+    assert bf._breaker.consecutive_failures == 1
     state["fail"] = False
     assert await bf.chat("hi") == "ok"
-    assert bf.breaker.consecutive_failures == 0
+    assert bf._breaker.consecutive_failures == 0
 
 
 async def test_a_spent_retry_budget_counts_once_not_once_per_attempt() -> None:
@@ -800,8 +792,8 @@ async def test_a_spent_retry_budget_counts_once_not_once_per_attempt() -> None:
         with pytest.raises(GatewayError):
             await bf.chat("hi")
     assert calls["n"] == 6, "two calls, three attempts each"
-    assert bf.breaker.consecutive_failures == 2
-    assert not bf.breaker.is_open
+    assert bf._breaker.consecutive_failures == 2
+    assert not bf._breaker.is_open
 
 
 async def test_threshold_zero_disables_the_breaker() -> None:
