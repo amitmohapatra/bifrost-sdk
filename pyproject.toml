@@ -28,6 +28,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["live: needs a running gateway; opt in with BIFROST_LIVE_URL"]
 
 [tool.ruff.lint.per-file-ignores]
 # PLR0913: the three verbs take many *keyword-only* arguments on purpose — that is the
