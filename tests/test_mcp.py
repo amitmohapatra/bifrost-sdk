@@ -7,6 +7,7 @@ Listing payloads are shaped like the running gateway's ``GET /api/mcp/clients`` 
 from __future__ import annotations
 
 import json as jsonlib
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ from bifrost_sdk import (
     MCPClient,
     MCPClientConfig,
     MCPConnection,
+    MCPLog,
     Options,
     ToolDef,
     Unreachable,
@@ -365,4 +367,98 @@ async def test_a_non_json_tool_result_is_a_gateway_error() -> None:
     bf = client(lambda r: httpx.Response(200, text="<html>"))
     with pytest.raises(GatewayError, match="non-JSON"):
         await bf.execute_tool({"function": {"name": "erp-answer", "arguments": "{}"}})
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- MCP logs
+
+SINCE = datetime(2026, 9, 30, 0, 5, tzinfo=UTC)
+
+#: Shaped like the gateway's GET /api/mcp-logs entries.
+LOGGED = {
+    "id": "log-1",
+    "request_id": "log-1",
+    "llm_request_id": "run-7",
+    "timestamp": "2026-09-30T00:06:02.926531806Z",
+    "tool_name": "read_wiki_structure",
+    "server_label": "docs",
+    "status": "success",
+    "arguments": '{"repoName":"maximhq/bifrost"}',
+    "result": {"content": "Available pages"},
+    "latency": 353,
+}
+FAILED = {
+    "id": "log-2",
+    "timestamp": "2026-09-30T00:06:03Z",
+    "tool_name": "x",
+    "status": "error",
+    "arguments": "not json",
+    "error_details": {"error": {"message": "tool 'x' is not available or not permitted"}},
+}
+
+
+async def test_mcp_logs_are_read_oldest_first_from_since() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(200, json={"logs": [LOGGED, FAILED], "pagination": {}})
+
+    bf = client(handler)
+    ok, failed = await bf.mcp_logs(SINCE, limit=50, parent_request_id="run-7")
+    assert seen["path"] == "/api/mcp-logs"
+    assert seen["query"] == {
+        "start_time": "2026-09-30T00:05:00+00:00",
+        "limit": "50",
+        "sort_by": "timestamp",
+        "order": "asc",
+        "llm_request_ids": "run-7",
+    }
+    assert ok == MCPLog(
+        id="log-1",
+        timestamp=datetime(2026, 9, 30, 0, 6, 2, 926531, tzinfo=UTC),
+        client="docs",
+        tool="read_wiki_structure",
+        status="success",
+        parent_request_id="run-7",
+        arguments={"repoName": "maximhq/bifrost"},
+        result={"content": "Available pages"},
+        latency_ms=353,
+    )
+    assert ok.name == "docs-read_wiki_structure"
+    assert failed.error == "tool 'x' is not available or not permitted"
+    assert failed.arguments == "not json", "unparseable arguments are kept verbatim"
+    assert failed.parent_request_id is None
+    await bf.aclose()
+
+
+async def test_without_a_parent_no_request_filter_is_sent() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request):
+        seen.update(request.url.params)
+        return httpx.Response(200, json={"logs": []})
+
+    bf = client(handler)
+    assert await bf.mcp_logs(SINCE) == []
+    assert "llm_request_ids" not in seen
+    assert seen["limit"] == "100"
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    ("since", "limit", "message"),
+    [
+        (datetime(2026, 9, 30), 10, "timezone-aware"),
+        (SINCE, 0, "between 1 and 1000"),
+        (SINCE, 1001, "between 1 and 1000"),
+    ],
+)
+async def test_bad_log_queries_are_refused_before_a_request(since, limit, message) -> None:
+    sent: list[httpx.Request] = []
+    bf = client(lambda r: (sent.append(r), httpx.Response(200, json={"logs": []}))[1])
+    with pytest.raises(ValueError, match=message):
+        await bf.mcp_logs(since, limit=limit)
+    assert sent == []
     await bf.aclose()

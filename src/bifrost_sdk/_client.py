@@ -22,6 +22,7 @@ import asyncio
 import json as jsonlib
 import re
 from collections.abc import AsyncIterator, Iterable, Sequence
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -36,12 +37,15 @@ from bifrost_sdk._errors import (
     from_response,
     unreachable,
 )
-from bifrost_sdk._mcp import MCP, ToolDef, scope
+from bifrost_sdk._mcp import MCP, MCPLog, ToolDef, scope
 from bifrost_sdk._retry import RETRYABLE, backoff
 from bifrost_sdk.headers import Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
+
+#: The gateway's maximum page size for ``GET /api/mcp-logs``.
+MAX_LOG_PAGE = 1000
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
@@ -101,7 +105,8 @@ class Bifrost:
         #: defaulting to the virtual key.
         self._admin = admin_client or management_client(base_url, admin_token or api_key, timeout)
         self._owns_admin = admin_client is None
-        self.mcp = MCP(ManagementAPI(self._admin))
+        self._api = ManagementAPI(self._admin)
+        self.mcp = MCP(self._api)
 
     # ----------------------------------------------------------------- the three verbs
 
@@ -267,6 +272,31 @@ class Bifrost:
             for tool in client.executable
             if admits(tool)
         ]
+
+    async def mcp_logs(
+        self, since: datetime, limit: int = 100, parent_request_id: str | None = None
+    ) -> list[MCPLog]:
+        """MCP tool executions logged at or after ``since``, oldest first.
+
+        ``parent_request_id`` narrows to executions made under that
+        ``Options(parent_request_id=)`` — for Code Mode, the nested calls of one script.
+        Logs are written asynchronously (a few seconds behind), and ``since`` is inclusive:
+        a caller paging forward dedups by :attr:`MCPLog.id`.
+        """
+        if since.tzinfo is None:
+            raise ValueError("since must be timezone-aware")
+        if not 1 <= limit <= MAX_LOG_PAGE:
+            raise ValueError(f"limit must be between 1 and {MAX_LOG_PAGE}")
+        params: dict[str, Any] = {
+            "start_time": since.isoformat(),
+            "limit": limit,
+            "sort_by": "timestamp",
+            "order": "asc",
+        }
+        if parent_request_id is not None:
+            params["llm_request_ids"] = parent_request_id
+        entries = await self._api.items("/api/mcp-logs", ("logs",), **params)
+        return [MCPLog._from_gateway(entry) for entry in entries]
 
     async def execute_tool(
         self,

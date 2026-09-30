@@ -11,7 +11,10 @@ Gateway facts this module encodes (verified against a running gateway):
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterable
+from contextlib import suppress
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -132,6 +135,47 @@ class MCPClient(_Frozen):
                 )
                 for tool in entry.get("tools") or ()
             ),
+        )
+
+
+class MCPLog(_Frozen):
+    """One MCP tool execution as the gateway logged it."""
+
+    id: str
+    timestamp: datetime
+    client: str
+    #: The tool's own name; :attr:`name` is the ``<client>-<tool>`` form requests use.
+    tool: str
+    status: str
+    #: The ``x-bf-parent-request-id`` the execution ran under (the gateway's ``llm_request_id``).
+    parent_request_id: str | None = None
+    arguments: Any = None
+    result: Any = None
+    error: str | None = None
+    latency_ms: float | None = None
+
+    @property
+    def name(self) -> str:
+        return f"{self.client}{TOOL_SEPARATOR}{self.tool}"
+
+    @classmethod
+    def _from_gateway(cls, entry: dict[str, Any]) -> MCPLog:
+        arguments = entry.get("arguments")
+        if isinstance(arguments, str):  # logged as the JSON text the model produced
+            with suppress(ValueError):
+                arguments = json.loads(arguments)
+        error = ((entry.get("error_details") or {}).get("error") or {}).get("message")
+        return cls(
+            id=entry["id"],
+            timestamp=entry["timestamp"],
+            client=str(entry.get("server_label") or ""),
+            tool=entry["tool_name"],
+            status=entry["status"],
+            parent_request_id=entry.get("llm_request_id"),
+            arguments=arguments,
+            result=entry.get("result"),
+            error=error,
+            latency_ms=entry.get("latency"),
         )
 
 
