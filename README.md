@@ -73,8 +73,15 @@ turn = await bf.execute_tool(tool_call, options=Options(mcp_clients=["erp"]))
 
 - `tools(clients, only)` lists what a request scoped with the same values could execute:
   disabled clients and tools outside a client's `tools_to_execute` are left out. `ToolDef`
-  carries `name` (`<client>-<tool>`), `client`, `description`, `parameters` (JSON schema) and
-  `code_mode`. The virtual key's own MCP allow-list is applied by the gateway at execution.
+  carries `name` (`<client>-<tool>`), `client`, `description`, `parameters` (JSON schema),
+  `code_mode` and `annotations`. The virtual key's own MCP allow-list is applied by the gateway
+  at execution.
+- `ToolDef.annotations` is the server's MCP `ToolAnnotations` — `read_only_hint`,
+  `destructive_hint`, `idempotent_hint`, `open_world_hint` (each `bool | None`) — or `None`
+  when the server published none. `GET /api/mcp/clients` drops annotations, so the listing
+  joins them from the gateway's own MCP endpoint (`POST /mcp`, `tools/list`), which keeps
+  them. When that endpoint is unavailable, or the server publishes none, `annotations` is
+  `None` and the memory service's tool catalog is the source of a tool's risk tier.
 - `execute_tool(tool_call)` takes an entry of a completion's `tool_calls`. It is not retried
   and does not count toward the circuit breaker: a tool may have side effects, and a refused
   call (out of scope, not allowed) is a 400 `GatewayError`.
@@ -178,8 +185,10 @@ uv run pytest                                            # unit tests, gateway m
 BIFROST_LIVE_URL=http://localhost:8091/v1 uv run pytest -m live  # against a running gateway
 ```
 
-The live tests register a temporary MCP client (`BIFROST_LIVE_MCP_URL`, default the public
-DeepWiki server) and remove it afterwards; they skip when the gateway is unreachable.
+The live tests register temporary MCP clients (`BIFROST_LIVE_MCP_URL`, default the public
+DeepWiki server, which publishes no annotations; `BIFROST_LIVE_ANNOTATED_MCP_URL`, default the
+public Context7 server, which does) and remove them afterwards; they skip when the gateway is
+unreachable.
 
 ## Install
 

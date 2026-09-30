@@ -7,6 +7,8 @@ Gateway facts this module encodes (verified against a running gateway):
 * A client's ``tools_to_execute`` is enforced at execution: ``["*"]`` allows all, an empty
   list allows none. The listing still shows every discovered tool.
 * ``PUT /api/mcp/client/{id}`` answers 200 but ignores connection changes.
+* ``GET /api/mcp/clients`` drops the servers' MCP tool annotations; the gateway's own MCP
+  endpoint (``POST /mcp``, JSON-RPC ``tools/list``) keeps them, keyed ``<client>-<tool>``.
 """
 
 from __future__ import annotations
@@ -17,9 +19,10 @@ from contextlib import suppress
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from bifrost_sdk._api import Resource
+from bifrost_sdk._errors import GatewayError
 
 ConnectionType = Literal["http", "sse", "stdio", "inprocess"]
 #: Between a client's name and its tool's name, in every name a request carries.
@@ -28,6 +31,8 @@ TOOL_SEPARATOR = "-"
 ALL = "*"
 #: The gateway's maximum page size for ``GET /api/mcp/clients``.
 _PAGE = 100
+#: The gateway's own MCP server: the one listing that carries tool annotations.
+_MCP_ENDPOINT = "/mcp"
 
 
 class _Frozen(BaseModel):
@@ -85,6 +90,20 @@ class MCPClientConfig(_Frozen):
         )
 
 
+class ToolAnnotations(BaseModel):
+    """The MCP server's hints about a tool (MCP ``ToolAnnotations``); each is ``None`` when the
+    server did not say. Hints, not guarantees: a server can mislabel its tools. Fields are the
+    MCP names in snake_case; the wire (camelCase) names parse too. Other keys (``title``) are
+    ignored."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore", populate_by_name=True)
+
+    read_only_hint: bool | None = Field(default=None, alias="readOnlyHint")
+    destructive_hint: bool | None = Field(default=None, alias="destructiveHint")
+    idempotent_hint: bool | None = Field(default=None, alias="idempotentHint")
+    open_world_hint: bool | None = Field(default=None, alias="openWorldHint")
+
+
 class ToolDef(_Frozen):
     """One MCP tool, named as requests name it: ``<client>-<tool>``."""
 
@@ -95,6 +114,9 @@ class ToolDef(_Frozen):
     #: The tool's client is a Code Mode client: completions see the Code Mode meta-tools
     #: (``listToolFiles``, ``readToolFile``, ``getToolDocs``, ``executeToolCode``) instead.
     code_mode: bool = False
+    #: The server's annotations, when the gateway's MCP listing carries them; ``None`` when
+    #: the server published none (the memory service's tool catalog is then the source).
+    annotations: ToolAnnotations | None = None
 
 
 class MCPClient(_Frozen):
@@ -117,7 +139,10 @@ class MCPClient(_Frozen):
         return tuple(t for t in self.tools if t.name.removeprefix(prefix) in allowed)
 
     @classmethod
-    def _from_gateway(cls, entry: dict[str, Any]) -> MCPClient:
+    def _from_gateway(
+        cls, entry: dict[str, Any], annotations: dict[str, ToolAnnotations] | None = None
+    ) -> MCPClient:
+        annotations = annotations or {}
         raw = entry["config"]
         config = MCPClientConfig._from_gateway(raw)
         return cls(
@@ -132,6 +157,7 @@ class MCPClient(_Frozen):
                     description=str(tool.get("description") or ""),
                     parameters=dict(tool.get("parameters") or {}),
                     code_mode=config.is_code_mode_client,
+                    annotations=annotations.get(f"{config.name}{TOOL_SEPARATOR}{tool['name']}"),
                 )
                 for tool in entry.get("tools") or ()
             ),
@@ -201,15 +227,40 @@ class MCP(Resource):
     """``bf.mcp`` — list and manage the gateway's MCP clients."""
 
     async def clients(self) -> list[MCPClient]:
-        """Every registered client, across all pages."""
-        found: list[MCPClient] = []
+        """Every registered client, across all pages, with its tools' annotations."""
+        entries: list[dict[str, Any]] = []
         while True:
             page = await self._api.items(
-                "/api/mcp/clients", ("clients",), limit=_PAGE, offset=len(found)
+                "/api/mcp/clients", ("clients",), limit=_PAGE, offset=len(entries)
             )
-            found.extend(MCPClient._from_gateway(entry) for entry in page)
+            entries.extend(page)
             if len(page) < _PAGE:
-                return found
+                break
+        annotations = await self._annotations() if any(e.get("tools") for e in entries) else {}
+        return [MCPClient._from_gateway(entry, annotations) for entry in entries]
+
+    async def _annotations(self) -> dict[str, ToolAnnotations]:
+        """``<client>-<tool>`` → annotations, from the gateway's MCP ``tools/list``.
+
+        Tools whose server published no hints are absent (the gateway lists them with
+        ``annotations: {}``). Best effort: a gateway whose MCP endpoint is off or refuses the
+        call yields no annotations rather than no tools.
+        """
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        try:
+            payload = await self._api.post(_MCP_ENDPOINT, request)
+        except GatewayError:
+            return {}
+        result = payload.get("result") if isinstance(payload, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        found: dict[str, ToolAnnotations] = {}
+        for tool in tools or ():
+            if isinstance(tool, dict) and isinstance(tool.get("annotations"), dict):
+                with suppress(ValidationError):  # a server's malformed hints are no hints
+                    hints = ToolAnnotations.model_validate(tool["annotations"])
+                    if hints.model_fields_set:  # the gateway sends {} for "none published"
+                        found[str(tool["name"])] = hints
+        return found
 
     async def add(self, config: MCPClientConfig) -> None:
         """Register a client. Refused by the gateway for private-network targets unless the

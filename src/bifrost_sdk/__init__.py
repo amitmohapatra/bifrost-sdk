@@ -26,7 +26,14 @@ from bifrost_sdk._errors import (
     RateLimited,
     Unreachable,
 )
-from bifrost_sdk._mcp import MCPClient, MCPClientConfig, MCPConnection, MCPLog, ToolDef
+from bifrost_sdk._mcp import (
+    MCPClient,
+    MCPClientConfig,
+    MCPConnection,
+    MCPLog,
+    ToolAnnotations,
+    ToolDef,
+)
 from bifrost_sdk._retry import RETRYABLE
 from bifrost_sdk.headers import Options
 
@@ -45,6 +52,7 @@ __all__ = [
     "Messages",
     "Options",
     "RateLimited",
+    "ToolAnnotations",
     "ToolDef",
     "Unreachable",
 ]

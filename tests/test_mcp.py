@@ -21,6 +21,7 @@ from bifrost_sdk import (
     MCPConnection,
     MCPLog,
     Options,
+    ToolAnnotations,
     ToolDef,
     Unreachable,
 )
@@ -63,14 +64,22 @@ def entry(
     }
 
 
-def listing(*entries: dict):
+def listing(*entries: dict, mcp: httpx.Response | None = None):
+    """The client listing; ``mcp`` answers the gateway's ``POST /mcp`` (default: no tools)."""
     requests: list[httpx.Request] = []
 
     def handler(request):
         requests.append(request)
+        if request.url.path == "/mcp":
+            return mcp or rpc_tools([])
         return httpx.Response(200, json={"clients": list(entries), "count": len(entries)})
 
     return requests, handler
+
+
+def rpc_tools(tools: list[dict]) -> httpx.Response:
+    """The gateway MCP endpoint's JSON-RPC ``tools/list`` answer."""
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}})
 
 
 def names(tools: list[ToolDef]) -> list[str]:
@@ -121,6 +130,64 @@ async def test_clients_are_read_across_every_page() -> None:
     bf = client(handler)
     assert len(await bf.mcp.clients()) == 103
     assert offsets == ["0", "100"]
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- tool annotations
+
+
+async def test_annotations_come_from_the_gateway_mcp_listing() -> None:
+    """``/api/mcp/clients`` drops annotations; the gateway's ``/mcp`` keeps them by full name."""
+    hints = {"readOnlyHint": True, "destructiveHint": False, "title": "Stock"}
+    mcp = rpc_tools(
+        [
+            {"name": "erp-get_stock", "inputSchema": {}, "annotations": hints},
+            {"name": "erp-create_po", "inputSchema": {}, "annotations": {}},
+        ]
+    )
+    requests, handler = listing(entry("erp", ["get_stock", "create_po"]), mcp=mcp)
+    bf = client(handler)
+    stock, po = (await bf.mcp.clients())[0].tools
+    assert stock.annotations == ToolAnnotations(read_only_hint=True, destructive_hint=False)
+    assert stock.annotations.idempotent_hint is None
+    assert po.annotations is None
+    [call] = [r for r in requests if r.url.path == "/mcp"]
+    assert call.method == "POST"
+    assert jsonlib.loads(call.content)["method"] == "tools/list"
+    await bf.aclose()
+
+
+async def test_annotations_reach_the_scoped_tool_listing() -> None:
+    mcp = rpc_tools([{"name": "erp-get_stock", "annotations": {"destructiveHint": True}}])
+    _, handler = listing(entry("erp", ["get_stock"]), mcp=mcp)
+    bf = client(handler)
+    [tool] = await bf.tools()
+    assert tool.annotations is not None and tool.annotations.destructive_hint is True
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    "mcp",
+    [
+        httpx.Response(404, text="404 page not found"),
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}}),
+        rpc_tools([{"name": "erp-get_stock", "annotations": {"readOnlyHint": "maybe"}}]),
+    ],
+    ids=["endpoint-missing", "rpc-error", "malformed-hints"],
+)
+async def test_unusable_annotations_leave_tools_listed_without_them(mcp) -> None:
+    _, handler = listing(entry("erp", ["get_stock"]), mcp=mcp)
+    bf = client(handler)
+    [tool] = await bf.tools()
+    assert (tool.name, tool.annotations) == ("erp-get_stock", None)
+    await bf.aclose()
+
+
+async def test_no_annotation_lookup_without_tools() -> None:
+    requests, handler = listing(entry("empty", []))
+    bf = client(handler)
+    await bf.mcp.clients()
+    assert [r.url.path for r in requests] == ["/api/mcp/clients"]
     await bf.aclose()
 
 

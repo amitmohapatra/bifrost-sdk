@@ -1,8 +1,10 @@
 """Against a running gateway. Opt-in: set ``BIFROST_LIVE_URL`` (e.g. ``http://localhost:8091/v1``).
 
-Registers a temporary MCP client (``BIFROST_LIVE_MCP_URL``, default the public DeepWiki
-server — the gateway refuses private-network targets to unauthenticated callers) and removes
-it afterwards. Skipped when the variable is unset or the gateway is unreachable.
+Registers temporary MCP clients (``BIFROST_LIVE_MCP_URL``, default the public DeepWiki
+server — the gateway refuses private-network targets to unauthenticated callers; and
+``BIFROST_LIVE_ANNOTATED_MCP_URL``, default the public Context7 server, which publishes MCP
+tool annotations) and removes them afterwards. Skipped when the variable is unset or the
+gateway is unreachable.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -22,6 +25,7 @@ pytestmark = pytest.mark.live
 
 LIVE_URL = os.environ.get("BIFROST_LIVE_URL")
 MCP_URL = os.environ.get("BIFROST_LIVE_MCP_URL", "https://mcp.deepwiki.com/mcp")
+ANNOTATED_MCP_URL = os.environ.get("BIFROST_LIVE_ANNOTATED_MCP_URL", "https://mcp.context7.com/mcp")
 #: A tool the default server exposes, and one it exposes that the client will not allow.
 TOOL, OTHER = "read_wiki_structure", "ask_wiki_question"
 #: How long discovery and the asynchronous log writer get before a test gives up.
@@ -50,12 +54,13 @@ async def bf() -> AsyncIterator[Bifrost]:
     await client.aclose()
 
 
-@pytest.fixture
-async def probe(bf: Bifrost) -> AsyncIterator[MCPClient]:
+@asynccontextmanager
+async def _registered(bf: Bifrost, url: str, allowed: tuple[str, ...]) -> AsyncIterator[MCPClient]:
+    """A temporary client for ``url``, once the gateway has discovered its tools."""
     config = MCPClientConfig(
         name=f"bfsdklive{uuid.uuid4().hex[:8]}",
-        connection=MCPConnection(type="http", url=MCP_URL),
-        tools_to_execute=(TOOL,),
+        connection=MCPConnection(type="http", url=url),
+        tools_to_execute=allowed,
     )
     await bf.mcp.add(config)
     try:
@@ -69,6 +74,12 @@ async def probe(bf: Bifrost) -> AsyncIterator[MCPClient]:
         for client in await bf.mcp.clients():
             if client.config.name == config.name:
                 await bf.mcp.remove(client.id)
+
+
+@pytest.fixture
+async def probe(bf: Bifrost) -> AsyncIterator[MCPClient]:
+    async with _registered(bf, MCP_URL, (TOOL,)) as client:
+        yield client
 
 
 def _call(name: str, arguments: dict[str, str]) -> dict:
@@ -141,3 +152,18 @@ async def test_a_connection_change_is_refused_locally(bf: Bifrost, probe: MCPCli
     )
     with pytest.raises(ValueError, match="remove and add"):
         await bf.mcp.update(probe, moved)
+
+
+async def test_annotations_survive_the_gateway(bf: Bifrost) -> None:
+    """The server's MCP annotations reach ``ToolDef``; a server without them gives ``None``."""
+    async with _registered(bf, ANNOTATED_MCP_URL, ("*",)) as annotated:
+        assert annotated.tools
+        for tool in annotated.tools:
+            assert tool.annotations is not None
+            assert tool.annotations.read_only_hint is True
+        [listed] = await bf.tools(clients=[annotated.config.name], only=[annotated.tools[0].name])
+        assert listed.annotations == annotated.tools[0].annotations
+
+
+async def test_a_server_without_annotations_lists_none(probe: MCPClient) -> None:
+    assert all(t.annotations is None for t in probe.tools)
