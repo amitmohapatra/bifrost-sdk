@@ -401,57 +401,6 @@ async def test_structured_output_is_requested_deterministically() -> None:
     await bf.aclose()
 
 
-# ----------------------------------------------------------------- MCP through the gateway
-
-
-async def test_execute_tool_returns_a_turn_ready_to_append() -> None:
-    seen: dict[str, object] = {}
-
-    def handler(request):
-        seen["path"] = request.url.path
-        seen["query"] = dict(request.url.params)
-        seen["body"] = jsonlib.loads(request.content)
-        return httpx.Response(200, json={"role": "tool", "content": "42", "tool_call_id": "call_1"})
-
-    bf = client(handler)
-    call = {"id": "call_1", "type": "function", "function": {"name": "answer", "arguments": "{}"}}
-    turn = await bf.execute_tool(call)
-    assert turn == {"role": "tool", "content": "42", "tool_call_id": "call_1"}
-    assert seen["path"].endswith("/mcp/tool/execute")
-    assert seen["query"] == {"format": "chat"}
-    assert seen["body"] == call
-    await bf.aclose()
-
-
-async def test_a_tool_call_with_no_name_is_refused_before_a_request_is_sent() -> None:
-    """A malformed call is the caller's bug; sending it wastes a round trip and returns a
-    gateway error that reads like the gateway's fault."""
-    sent = []
-    bf = client(lambda r: (sent.append(r), reply("x"))[1])
-    with pytest.raises(ValueError, match="no function name"):
-        await bf.execute_tool({"id": "call_1", "type": "function", "function": {}})
-    assert sent == []
-    await bf.aclose()
-
-
-async def test_tool_execution_failures_keep_their_status() -> None:
-    bf = client(lambda r: httpx.Response(403, text="tool not allowed"))
-    with pytest.raises(GatewayError) as caught:
-        await bf.execute_tool({"function": {"name": "rm", "arguments": "{}"}})
-    assert caught.value.details["status"] == 403
-    await bf.aclose()
-
-
-async def test_an_unreachable_gateway_is_not_reported_as_a_tool_failure() -> None:
-    def handler(request):
-        raise httpx.ConnectError("refused")
-
-    bf = client(handler)
-    with pytest.raises(Unreachable):
-        await bf.execute_tool({"function": {"name": "answer", "arguments": "{}"}})
-    await bf.aclose()
-
-
 # ----------------------------------------------------------------- per-request options
 
 

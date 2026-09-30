@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any
 
 import httpx
@@ -36,7 +36,7 @@ from bifrost_sdk._errors import (
     from_response,
     unreachable,
 )
-from bifrost_sdk._mcp import MCP
+from bifrost_sdk._mcp import MCP, ToolDef, scope
 from bifrost_sdk._retry import RETRYABLE, backoff
 from bifrost_sdk.headers import Options
 
@@ -248,30 +248,48 @@ class Bifrost:
 
     # ----------------------------------------------------------------- MCP tools
 
+    async def tools(
+        self, clients: Iterable[str] | None = None, only: Iterable[str] | None = None
+    ) -> list[ToolDef]:
+        """The MCP tools a request scoped this way could execute.
+
+        ``clients`` and ``only`` mean what ``Options(mcp_clients=, mcp_tools=)`` mean on a
+        request: ``None`` is unscoped, an empty sequence is nothing; tools are named
+        ``<client>-<tool>`` or ``<client>-*``. Disabled clients and tools outside a client's
+        ``tools_to_execute`` are left out. The virtual key's own MCP allow-list is not
+        applied here — the gateway applies it at execution.
+        """
+        admits = scope(clients, only)
+        return [
+            tool
+            for client in await self.mcp.clients()
+            if not client.disabled
+            for tool in client.executable
+            if admits(tool)
+        ]
+
     async def execute_tool(
         self,
         tool_call: dict[str, Any],
         *,
+        options: Options | None = None,
         timeout: float | None = None,  # noqa: ASYNC109 - httpx transport timeout, see complete()
     ) -> dict[str, Any]:
-        """Run one tool call against the gateway's MCP servers; return the turn to append.
+        """Run one MCP tool call through the gateway; return the ``{"role": "tool"}`` turn.
 
-        The gateway discovers MCP servers and injects their tools into the request on its
-        own, but it deliberately does **not** run them: it hands the calls back and waits to
-        be asked. That is the useful half of the bargain — the caller keeps the decision, so
-        a policy check, an audit record or a human approval can sit in front of a tool that
-        sends email, and none of that is possible once the gateway has already sent it.
-
-        Takes the tool-call object straight out of a completion's ``tool_calls`` and returns
-        a ``{"role": "tool", ...}`` message ready to append to the conversation, so a caller
-        never has to know the MCP wire format at all.
+        ``tool_call`` is an entry of a completion's ``tool_calls`` (chat format), its name
+        ``<client>-<tool>`` or a Code Mode meta-tool. ``options`` scopes it like a completion
+        (``mcp_clients``/``mcp_tools``) and correlates it (``parent_request_id``: Code Mode's
+        nested calls are logged under it, see :meth:`mcp_logs`). Not retried and not counted
+        by the breaker: a tool may have side effects, and a refused call is a 400.
         """
-        name = (tool_call.get("function") or {}).get("name") or tool_call.get("name")
-        if not name:
+        if not (tool_call.get("function") or {}).get("name"):
             raise ValueError("tool_call has no function name")
         request: dict[str, Any] = {"json": tool_call, "params": {"format": "chat"}}
         if timeout is not None:
             request["timeout"] = timeout
+        if options is not None:
+            request["headers"] = options.headers()
         try:
             response = await self._client.post("/mcp/tool/execute", **request)
         except httpx.TransportError as exc:

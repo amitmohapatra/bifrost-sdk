@@ -10,7 +10,9 @@
         raw = await bf.complete("summarise this")  # usage, tool calls, finish reason
 
 Per-request gateway behaviour (stored prompt, MCP scope, session, spend attribution, no
-content logging) is an :class:`Options` passed as ``options=``.
+content logging) is an :class:`Options` passed as ``options=``. MCP tools are listed with
+``bf.tools(...)`` and run with ``bf.execute_tool(call)``; the MCP clients themselves are
+managed through ``bf.mcp``. Gateway administration lives in :mod:`bifrost_sdk.admin`.
 """
 
 from bifrost_sdk._client import Bifrost, Messages
@@ -23,6 +25,7 @@ from bifrost_sdk._errors import (
     RateLimited,
     Unreachable,
 )
+from bifrost_sdk._mcp import MCPClient, MCPClientConfig, MCPConnection, ToolDef
 from bifrost_sdk._retry import RETRYABLE
 from bifrost_sdk.headers import Options
 
@@ -34,8 +37,12 @@ __all__ = [
     "EmptyResponse",
     "GatewayError",
     "InvalidJSON",
+    "MCPClient",
+    "MCPClientConfig",
+    "MCPConnection",
     "Messages",
     "Options",
     "RateLimited",
+    "ToolDef",
     "Unreachable",
 ]
