@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from bifrost_sdk import Bifrost, GatewayError, MCPClient, MCPClientConfig, MCPConnection, Options
+from bifrost_sdk.admin import Admin
 
 pytestmark = pytest.mark.live
 
@@ -167,3 +168,23 @@ async def test_annotations_survive_the_gateway(bf: Bifrost) -> None:
 
 async def test_a_server_without_annotations_lists_none(probe: MCPClient) -> None:
     assert all(t.annotations is None for t in probe.tools)
+
+
+async def test_a_virtual_key_lists_only_the_tools_it_allows(bf: Bifrost) -> None:
+    """``tools()`` under a virtual key is that key's MCP allow-list, as the gateway reads it."""
+    assert LIVE_URL is not None
+    async with (
+        _registered(bf, MCP_URL, ("*",)) as registered,
+        Admin(LIVE_URL) as admin,
+    ):
+        name = registered.config.name
+        created = await admin.vk.create(
+            f"{name}-key",
+            mcp_configs=[{"mcp_client_name": name, "tools_to_execute": [TOOL]}],
+        )
+        key = created["virtual_key"]
+        try:
+            async with Bifrost(LIVE_URL, api_key=key["value"]) as scoped:
+                assert [t.name for t in await scoped.tools()] == [f"{name}-{TOOL}"]
+        finally:
+            await admin.vk.delete(key["id"])

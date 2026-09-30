@@ -9,6 +9,8 @@ Gateway facts this module encodes (verified against a running gateway):
 * ``PUT /api/mcp/client/{id}`` answers 200 but ignores connection changes.
 * ``GET /api/mcp/clients`` drops the servers' MCP tool annotations; the gateway's own MCP
   endpoint (``POST /mcp``, JSON-RPC ``tools/list``) keeps them, keyed ``<client>-<tool>``.
+* ``POST /mcp`` lists only what the calling virtual key's MCP allow-list admits (a key with
+  no MCP configuration sees no tools); without a key it lists every executable tool.
 """
 
 from __future__ import annotations
@@ -228,6 +230,11 @@ class MCP(Resource):
 
     async def clients(self) -> list[MCPClient]:
         """Every registered client, across all pages, with its tools' annotations."""
+        return (await self._clients())[0]
+
+    async def _clients(self) -> tuple[list[MCPClient], frozenset[str] | None]:
+        """The clients, and the ``<client>-<tool>`` names the gateway's MCP endpoint lists for
+        this client's key (``None`` when that endpoint could not be asked)."""
         entries: list[dict[str, Any]] = []
         while True:
             page = await self._api.items(
@@ -236,30 +243,38 @@ class MCP(Resource):
             entries.extend(page)
             if len(page) < _PAGE:
                 break
-        annotations = await self._annotations() if any(e.get("tools") for e in entries) else {}
-        return [MCPClient._from_gateway(entry, annotations) for entry in entries]
+        listed = await self._listing() if any(e.get("tools") for e in entries) else {}
+        annotations = {name: hints for name, hints in (listed or {}).items() if hints is not None}
+        clients = [MCPClient._from_gateway(entry, annotations) for entry in entries]
+        return clients, None if listed is None else frozenset(listed)
 
-    async def _annotations(self) -> dict[str, ToolAnnotations]:
+    async def _listing(self) -> dict[str, ToolAnnotations | None] | None:
         """``<client>-<tool>`` → annotations, from the gateway's MCP ``tools/list``.
 
-        Tools whose server published no hints are absent (the gateway lists them with
-        ``annotations: {}``). Best effort: a gateway whose MCP endpoint is off or refuses the
-        call yields no annotations rather than no tools.
+        The gateway answers it for the key the request carries: the tools that key's MCP
+        allow-list admits, no others. A tool whose server published no hints (the gateway
+        lists it with ``annotations: {}``), or malformed ones, maps to ``None``. ``None`` for
+        the whole listing means the endpoint is off or refused the call.
         """
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         try:
             payload = await self._api.post(_MCP_ENDPOINT, request)
         except GatewayError:
-            return {}
+            return None
         result = payload.get("result") if isinstance(payload, dict) else None
         tools = result.get("tools") if isinstance(result, dict) else None
-        found: dict[str, ToolAnnotations] = {}
-        for tool in tools or ():
-            if isinstance(tool, dict) and isinstance(tool.get("annotations"), dict):
+        if not isinstance(tools, list):
+            return None
+        found: dict[str, ToolAnnotations | None] = {}
+        for tool in tools:
+            if not isinstance(tool, dict) or "name" not in tool:
+                continue
+            hints = None
+            if isinstance(tool.get("annotations"), dict):
                 with suppress(ValidationError):  # a server's malformed hints are no hints
-                    hints = ToolAnnotations.model_validate(tool["annotations"])
-                    if hints.model_fields_set:  # the gateway sends {} for "none published"
-                        found[str(tool["name"])] = hints
+                    parsed = ToolAnnotations.model_validate(tool["annotations"])
+                    hints = parsed if parsed.model_fields_set else None
+            found[str(tool["name"])] = hints
         return found
 
     async def add(self, config: MCPClientConfig) -> None:

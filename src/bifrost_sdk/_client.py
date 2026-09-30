@@ -260,17 +260,20 @@ class Bifrost:
 
         ``clients`` and ``only`` mean what ``Options(mcp_clients=, mcp_tools=)`` mean on a
         request: ``None`` is unscoped, an empty sequence is nothing; tools are named
-        ``<client>-<tool>`` or ``<client>-*``. Disabled clients and tools outside a client's
-        ``tools_to_execute`` are left out. The virtual key's own MCP allow-list is not
-        applied here — the gateway applies it at execution.
+        ``<client>-<tool>`` or ``<client>-*``. Disabled clients, tools outside a client's
+        ``tools_to_execute`` and tools the virtual key's MCP allow-list does not admit are left
+        out (the key's view is the gateway's own MCP listing, asked with the ``/api`` token — the
+        virtual key unless ``admin_token`` was given; a gateway whose MCP endpoint
+        cannot be asked still enforces the key at execution).
         """
         admits = scope(clients, only)
+        found, allowed = await self.mcp._clients()
         return [
             tool
-            for client in await self.mcp.clients()
+            for client in found
             if not client.disabled
             for tool in client.executable
-            if admits(tool)
+            if admits(tool) and (allowed is None or tool.name in allowed)
         ]
 
     async def mcp_logs(

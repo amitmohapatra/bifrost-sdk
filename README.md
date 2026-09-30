@@ -72,10 +72,11 @@ turn = await bf.execute_tool(tool_call, options=Options(mcp_clients=["erp"]))
 ```
 
 - `tools(clients, only)` lists what a request scoped with the same values could execute:
-  disabled clients and tools outside a client's `tools_to_execute` are left out. `ToolDef`
-  carries `name` (`<client>-<tool>`), `client`, `description`, `parameters` (JSON schema),
-  `code_mode` and `annotations`. The virtual key's own MCP allow-list is applied by the gateway
-  at execution.
+  disabled clients, tools outside a client's `tools_to_execute` and tools the virtual key's MCP
+  allow-list does not admit are left out (the key's view is the gateway's own MCP listing,
+  `POST /mcp` `tools/list`, which answers per key; a key with no MCP configuration sees no
+  tools). `ToolDef` carries `name` (`<client>-<tool>`), `client`, `description`, `parameters`
+  (JSON schema), `code_mode` and `annotations`.
 - `ToolDef.annotations` is the server's MCP `ToolAnnotations` — `read_only_hint`,
   `destructive_hint`, `idempotent_hint`, `open_world_hint` (each `bool | None`) — or `None`
   when the server published none. `GET /api/mcp/clients` drops annotations, so the listing

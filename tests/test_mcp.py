@@ -65,13 +65,19 @@ def entry(
 
 
 def listing(*entries: dict, mcp: httpx.Response | None = None):
-    """The client listing; ``mcp`` answers the gateway's ``POST /mcp`` (default: no tools)."""
+    """The client listing; ``mcp`` answers the gateway's ``POST /mcp`` (default: every tool
+    listed, none annotated — a key that may use them all)."""
     requests: list[httpx.Request] = []
+    every = [
+        {"name": f"{e['config']['name']}-{t['name']}", "annotations": {}}
+        for e in entries
+        for t in e.get("tools") or ()
+    ]
 
     def handler(request):
         requests.append(request)
         if request.url.path == "/mcp":
-            return mcp or rpc_tools([])
+            return mcp or rpc_tools(every)
         return httpx.Response(200, json={"clients": list(entries), "count": len(entries)})
 
     return requests, handler
@@ -180,6 +186,17 @@ async def test_unusable_annotations_leave_tools_listed_without_them(mcp) -> None
     bf = client(handler)
     [tool] = await bf.tools()
     assert (tool.name, tool.annotations) == ("erp-get_stock", None)
+    await bf.aclose()
+
+
+async def test_the_listing_is_what_the_virtual_key_allows() -> None:
+    """The gateway's MCP endpoint answers for the key: tools outside its allow-list are not
+    listed, so they are not offered."""
+    mcp = rpc_tools([{"name": "erp-get_stock", "annotations": {}}])
+    _, handler = listing(entry("erp", ["get_stock", "create_po"]), mcp=mcp)
+    bf = client(handler)
+    assert names(await bf.tools()) == ["erp-get_stock"]
+    assert len((await bf.mcp.clients())[0].tools) == 2  # the registry still lists both
     await bf.aclose()
 
 
