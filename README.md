@@ -71,18 +71,26 @@ turn = await bf.execute_tool(tool_call, options=Options(mcp_clients=["erp"]))
 # turn is {"role": "tool", "content": ..., "tool_call_id": ...}, ready to append
 ```
 
-- `tools(clients, only)` lists what a request scoped with the same values could execute:
-  disabled clients, tools outside a client's `tools_to_execute` and tools the virtual key's MCP
-  allow-list does not admit are left out (the key's view is the gateway's own MCP listing,
-  `POST /mcp` `tools/list`, which answers per key; a key with no MCP configuration sees no
-  tools). `ToolDef` carries `name` (`<client>-<tool>`), `client`, `description`, `parameters`
-  (JSON schema), `code_mode` and `annotations`.
+- `tools(clients, only)` lists what a request scoped with the same values could execute, as
+  the gateway lists it for the virtual key: its own MCP endpoint (`POST /mcp`, JSON-RPC
+  `tools/list`) asked with the key — never `/api`, which admin auth closes to a virtual key.
+  So the listing is exactly what the key's MCP allow-list admits (a key with no MCP
+  configuration sees no tools), and a listing the gateway refuses raises `GatewayError`.
+  `ToolDef` carries `name` (`<client>-<tool>`), `client`, `description`, `parameters` (JSON
+  schema), `code_mode` and `annotations`.
 - `ToolDef.annotations` is the server's MCP `ToolAnnotations` — `read_only_hint`,
   `destructive_hint`, `idempotent_hint`, `open_world_hint` (each `bool | None`) — or `None`
-  when the server published none. `GET /api/mcp/clients` drops annotations, so the listing
-  joins them from the gateway's own MCP endpoint (`POST /mcp`, `tools/list`), which keeps
-  them. When that endpoint is unavailable, or the server publishes none, `annotations` is
-  `None` and the memory service's tool catalog is the source of a tool's risk tier.
+  when the server published none; the memory service's tool catalog is then the source of a
+  tool's risk tier.
+- A **Code Mode** client's tools are not in `tools/list` (its meta-tools are). `tools()` reads
+  them from the meta-tools — `listToolFiles` names the Code Mode clients, `readToolFile` holds
+  one `def tool(param: type, ...)` declaration per tool — and marks them `code_mode=True`.
+  The gateway publishes no JSON schema and no annotations for them: `parameters` is derived
+  from the signature (`str`/`int`/`float`/`bool`/`list`/`dict`; any other type admits any
+  value; a parameter with a default is optional), `annotations` is `None`, and the
+  description is the declaration's comment, which the gateway may truncate.
+- `bf.mcp.clients()` is the admin registry (`GET /api/mcp/clients`, every discovered tool,
+  annotations joined from `/mcp`); with admin auth on it needs `admin_token`.
 - `execute_tool(tool_call)` takes an entry of a completion's `tool_calls`. It is not retried
   and does not count toward the circuit breaker: a tool may have side effects, and a refused
   call (out of scope, not allowed) is a 400 `GatewayError`.

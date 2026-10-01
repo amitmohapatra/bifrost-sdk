@@ -163,40 +163,138 @@ async def test_annotations_come_from_the_gateway_mcp_listing() -> None:
     await bf.aclose()
 
 
-async def test_annotations_reach_the_scoped_tool_listing() -> None:
-    mcp = rpc_tools([{"name": "erp-get_stock", "annotations": {"destructiveHint": True}}])
-    _, handler = listing(entry("erp", ["get_stock"]), mcp=mcp)
-    bf = client(handler)
-    [tool] = await bf.tools()
-    assert tool.annotations is not None and tool.annotations.destructive_hint is True
+def gateway_mcp(tools: list[dict], files: dict[str, str] | None = None):
+    """The gateway's ``POST /mcp`` for one virtual key: ``tools/list`` answers ``tools`` (with
+    the meta-tools when ``files`` names Code Mode clients), ``listToolFiles`` and
+    ``readToolFile`` answer from ``files`` (``<client>`` -> its declarations)."""
+    requests: list[httpx.Request] = []
+    meta = [{"name": n, "annotations": {}} for n in ("executeToolCode", "listToolFiles")]
+
+    def text(value: str) -> httpx.Response:
+        result = {"content": [{"type": "text", "text": value}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path != "/mcp":
+            return httpx.Response(401, text="Unauthorized")
+        body = jsonlib.loads(request.content)
+        if body["method"] == "tools/list":
+            return rpc_tools([*tools, *(meta if files else [])])
+        call = body["params"]
+        if call["name"] == "listToolFiles":
+            listed = "".join(f"\n  {c}.pyi" for c in files or {})
+            return text(f"# Workflow: listToolFiles -> readToolFile\n\nservers/{listed}")
+        client_name = call["arguments"]["fileName"].removeprefix("servers/").removesuffix(".pyi")
+        return text((files or {})[client_name])
+
+    return requests, handler
+
+
+async def test_tools_are_the_virtual_keys_mcp_listing_never_the_admin_api() -> None:
+    """With admin auth on, ``/api/*`` refuses a virtual key: the listing is ``POST /mcp``
+    ``tools/list`` with the key, which holds exactly what the key allows."""
+    tools = [
+        {
+            "name": "erp-get_stock",
+            "description": "Stock of a SKU",
+            "inputSchema": {"type": "object", "properties": {"sku": {"type": "string"}}},
+            "annotations": {"readOnlyHint": True},
+        },
+        {"name": "crm-find", "inputSchema": {"type": "object"}, "annotations": {}},
+    ]
+    requests, handler = gateway_mcp(tools)
+    transport = httpx.MockTransport(handler)
+    bf = Bifrost(
+        BASE,
+        api_key="vk-1",
+        client=httpx.AsyncClient(
+            transport=transport, base_url=BASE, headers={"Authorization": "Bearer vk-1"}
+        ),
+        admin_client=httpx.AsyncClient(transport=transport, base_url="http://gateway.test"),
+    )
+    stock, find = await bf.tools()
+    assert (stock.name, stock.client, stock.description) == (
+        "erp-get_stock",
+        "erp",
+        "Stock of a SKU",
+    )
+    assert stock.parameters["properties"] == {"sku": {"type": "string"}}
+    assert stock.annotations == ToolAnnotations(read_only_hint=True)
+    assert (find.client, find.annotations, find.code_mode) == ("crm", None, False)
+    assert [r.url.path for r in requests] == ["/mcp"]
+    assert requests[0].headers["Authorization"] == "Bearer vk-1"
+    assert jsonlib.loads(requests[0].content)["method"] == "tools/list"
     await bf.aclose()
 
 
-@pytest.mark.parametrize(
-    "mcp",
-    [
-        httpx.Response(404, text="404 page not found"),
-        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}}),
-        rpc_tools([{"name": "erp-get_stock", "annotations": {"readOnlyHint": "maybe"}}]),
-    ],
-    ids=["endpoint-missing", "rpc-error", "malformed-hints"],
-)
-async def test_unusable_annotations_leave_tools_listed_without_them(mcp) -> None:
-    _, handler = listing(entry("erp", ["get_stock"]), mcp=mcp)
+async def test_malformed_annotations_leave_a_tool_listed_without_them() -> None:
+    _, handler = gateway_mcp([{"name": "erp-get_stock", "annotations": {"readOnlyHint": "x"}}])
     bf = client(handler)
     [tool] = await bf.tools()
     assert (tool.name, tool.annotations) == ("erp-get_stock", None)
     await bf.aclose()
 
 
-async def test_the_listing_is_what_the_virtual_key_allows() -> None:
-    """The gateway's MCP endpoint answers for the key: tools outside its allow-list are not
-    listed, so they are not offered."""
-    mcp = rpc_tools([{"name": "erp-get_stock", "annotations": {}}])
-    _, handler = listing(entry("erp", ["get_stock", "create_po"]), mcp=mcp)
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(401, text="Unauthorized"),
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}}),
+    ],
+    ids=["refused", "rpc-error"],
+)
+async def test_a_listing_the_gateway_refuses_is_an_error_not_an_empty_toolbox(answer) -> None:
+    bf = client(lambda request: answer)
+    with pytest.raises(GatewayError):
+        await bf.tools()
+    await bf.aclose()
+
+
+DECLARATIONS = """# Total lines: 4 (this is the complete file, no need to paginate)
+# docs server tools
+
+def search(query: str, limit: int = None, tags: list[str] = None) -> dict:  # Search the docs.
+def fetch(path: str, options: dict[str, Any], raw: Any) -> dict:  # Fetch one page...
+"""
+
+
+async def test_code_mode_clients_are_read_from_the_meta_tools_declarations() -> None:
+    """``tools/list`` shows a Code Mode client's meta-tools, not its tools: they come from
+    ``listToolFiles`` and ``readToolFile``, marked ``code_mode``, with no annotations."""
+    requests, handler = gateway_mcp(
+        [{"name": "erp-get_stock", "annotations": {}}], files={"docs": DECLARATIONS}
+    )
     bf = client(handler)
-    assert names(await bf.tools()) == ["erp-get_stock"]
-    assert len((await bf.mcp.clients())[0].tools) == 2  # the registry still lists both
+    tools = await bf.tools()
+    assert names(tools) == ["erp-get_stock", "docs-search", "docs-fetch"]
+    erp, search, fetch = tools
+    assert not erp.code_mode and search.code_mode and fetch.code_mode
+    assert (search.client, search.description, search.annotations) == (
+        "docs",
+        "Search the docs.",
+        None,
+    )
+    assert search.parameters == {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer"},
+            "tags": {"type": "array"},
+        },
+        "required": ["query"],
+    }
+    assert fetch.parameters["properties"] == {
+        "path": {"type": "string"},
+        "options": {"type": "object"},
+        "raw": {},
+    }
+    assert fetch.parameters["required"] == ["path", "options", "raw"]
+    calls = [jsonlib.loads(r.content)["params"] for r in requests[1:]]
+    assert calls == [
+        {"name": "listToolFiles", "arguments": {}},
+        {"name": "readToolFile", "arguments": {"fileName": "servers/docs.pyi"}},
+    ]
     await bf.aclose()
 
 
@@ -321,26 +419,9 @@ async def test_removing_a_client_is_a_delete_by_id() -> None:
 # ----------------------------------------------------------------- scoped tool listing
 
 
-GATEWAY = (
-    entry("erp", ["get_stock", "create_po"]),
-    entry("crm", ["find", "update"], allowed=["find"]),
-    entry("docs", ["search"], code_mode=True),
-    entry("old", ["gone"], disabled=True),
-    entry("locked", ["secret"], allowed=[]),
-)
-
-
-async def test_unscoped_lists_every_executable_tool_of_enabled_clients() -> None:
-    """``tools_to_execute`` is enforced at execution, so tools outside it are not offered."""
-    _, handler = listing(*GATEWAY)
-    bf = client(handler)
-    assert names(await bf.tools()) == [
-        "erp-get_stock",
-        "erp-create_po",
-        "crm-find",
-        "docs-search",
-    ]
-    await bf.aclose()
+#: What the key's listing holds: erp's two tools, crm's ``find``, and Code Mode ``docs``.
+KEY_TOOLS = [{"name": n, "annotations": {}} for n in ("erp-get_stock", "erp-create_po", "crm-find")]
+KEY_FILES = {"docs": "def search(query: str) -> dict:  # Search.\n"}
 
 
 @pytest.mark.parametrize(
@@ -357,18 +438,9 @@ async def test_unscoped_lists_every_executable_tool_of_enabled_clients() -> None
     ],
 )
 async def test_scoping_follows_the_include_header_semantics(clients, only, expected) -> None:
-    _, handler = listing(*GATEWAY)
+    _, handler = gateway_mcp(KEY_TOOLS, files=KEY_FILES)
     bf = client(handler)
     assert names(await bf.tools(clients=clients, only=only)) == expected
-    await bf.aclose()
-
-
-async def test_code_mode_tools_are_marked() -> None:
-    _, handler = listing(*GATEWAY)
-    bf = client(handler)
-    marked = {t.name: t.code_mode for t in await bf.tools()}
-    assert marked["docs-search"] is True
-    assert marked["erp-get_stock"] is False
     await bf.aclose()
 
 

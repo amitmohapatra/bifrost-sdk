@@ -27,7 +27,7 @@ from typing import Any
 
 import httpx
 
-from bifrost_sdk._api import CONNECT_TIMEOUT, ManagementAPI, management_client
+from bifrost_sdk._api import CONNECT_TIMEOUT, ManagementAPI, management_client, origin
 from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._errors import (
     ERROR_STATUS,
@@ -37,13 +37,24 @@ from bifrost_sdk._errors import (
     from_response,
     unreachable,
 )
-from bifrost_sdk._mcp import MCP, MCPLog, ToolDef, scope
+from bifrost_sdk._mcp import (
+    CODE_MODE_META_TOOLS,
+    MCP,
+    MCPLog,
+    ToolDef,
+    declared_tools,
+    listed_tool,
+    scope,
+    server_files,
+)
 from bifrost_sdk._retry import RETRYABLE, backoff
 from bifrost_sdk.headers import Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
 
+#: The gateway's own MCP server (a sibling of ``/v1``), the listing a virtual key may ask for.
+MCP_ENDPOINT = "/mcp"
 #: The gateway's maximum page size for ``GET /api/mcp-logs``.
 MAX_LOG_PAGE = 1000
 
@@ -256,25 +267,58 @@ class Bifrost:
     async def tools(
         self, clients: Iterable[str] | None = None, only: Iterable[str] | None = None
     ) -> list[ToolDef]:
-        """The MCP tools a request scoped this way could execute.
+        """The MCP tools a request scoped this way could execute, as the gateway lists them
+        for this client's virtual key.
 
         ``clients`` and ``only`` mean what ``Options(mcp_clients=, mcp_tools=)`` mean on a
         request: ``None`` is unscoped, an empty sequence is nothing; tools are named
-        ``<client>-<tool>`` or ``<client>-*``. Disabled clients, tools outside a client's
-        ``tools_to_execute`` and tools the virtual key's MCP allow-list does not admit are left
-        out (the key's view is the gateway's own MCP listing, asked with the ``/api`` token — the
-        virtual key unless ``admin_token`` was given; a gateway whose MCP endpoint
-        cannot be asked still enforces the key at execution).
+        ``<client>-<tool>`` or ``<client>-*``. The listing is the gateway's own MCP endpoint
+        (``POST /mcp``, JSON-RPC ``tools/list``) asked with the virtual key — never ``/api``,
+        which admin auth closes to a virtual key — so it holds exactly what the key allows,
+        with the servers' annotations. A Code Mode client's tools are not in it (its
+        meta-tools are): they are read from the meta-tools' declarations instead, marked
+        ``code_mode``, with signature-derived ``parameters`` and no ``annotations``.
         """
         admits = scope(clients, only)
-        found, allowed = await self.mcp._clients()
-        return [
-            tool
-            for client in found
-            if not client.disabled
-            for tool in client.executable
-            if admits(tool) and (allowed is None or tool.name in allowed)
-        ]
+        return [tool for tool in await self._listed_tools() if admits(tool)]
+
+    async def _listed_tools(self) -> list[ToolDef]:
+        result = await self._rpc("tools/list", {})
+        listed = [t for t in result.get("tools") or () if isinstance(t, dict) and "name" in t]
+        tools = [listed_tool(t) for t in listed if t["name"] not in CODE_MODE_META_TOOLS]
+        if any(t["name"] in CODE_MODE_META_TOOLS for t in listed):
+            files = await self._meta_text("listToolFiles", {})
+            for client in server_files(files):
+                text = await self._meta_text("readToolFile", {"fileName": f"servers/{client}.pyi"})
+                tools.extend(declared_tools(client, text))
+        return tools
+
+    async def _meta_text(self, name: str, arguments: dict[str, Any]) -> str:
+        """A Code Mode meta-tool's text answer, called through the gateway's MCP endpoint."""
+        result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
+        if result.get("isError"):
+            raise GatewayError(f"{name} failed", body=str(result.get("content"))[:300])
+        content = result.get("content") or ()
+        return "\n".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+
+    async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """One JSON-RPC call to the gateway's MCP endpoint, with the virtual key."""
+        request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        url = origin(str(self._client.base_url)) + MCP_ENDPOINT
+        try:
+            response = await self._client.post(url, json=request)
+        except httpx.TransportError as exc:
+            raise unreachable(exc) from exc
+        if response.status_code >= ERROR_STATUS:
+            raise from_response(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise GatewayError(f"MCP {method} returned a non-JSON body") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            raise GatewayError(f"MCP {method} failed: {error}", body=response.text[:300])
+        return payload["result"]
 
     async def mcp_logs(
         self, since: datetime, limit: int = 100, parent_request_id: str | None = None

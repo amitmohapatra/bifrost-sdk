@@ -10,12 +10,20 @@ Gateway facts this module encodes (verified against a running gateway):
 * ``GET /api/mcp/clients`` drops the servers' MCP tool annotations; the gateway's own MCP
   endpoint (``POST /mcp``, JSON-RPC ``tools/list``) keeps them, keyed ``<client>-<tool>``.
 * ``POST /mcp`` lists only what the calling virtual key's MCP allow-list admits (a key with
-  no MCP configuration sees no tools); without a key it lists every executable tool.
+  no MCP configuration sees no tools); without a key it lists every executable tool. It is
+  the one listing a virtual key may ask for: with admin auth on, ``/api/*`` refuses it (401).
+* For a Code Mode client, ``tools/list`` shows the meta-tools (``listToolFiles``,
+  ``readToolFile``, ``getToolDocs``, ``executeToolCode``) instead of its tools. The tools
+  themselves are only in the meta-tools' answers: ``listToolFiles`` names one
+  ``servers/<client>.pyi`` per Code Mode client, and ``readToolFile`` of it holds one
+  ``def <tool>(<param>: <type>, ...) -> dict:  # <description>`` line per tool — no JSON
+  schema and no annotations.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from datetime import datetime
@@ -225,16 +233,103 @@ def scope(clients: Iterable[str] | None, only: Iterable[str] | None) -> Callable
     return admits
 
 
+#: Bifrost's Code Mode meta-tools, as ``tools/list`` names them.
+CODE_MODE_META_TOOLS = frozenset(
+    {"listToolFiles", "readToolFile", "getToolDocs", "executeToolCode"}
+)
+_SERVER_FILE = re.compile(r"^\s*(?:servers/)?([A-Za-z0-9_.]+)\.pyi\s*$", re.M)
+_DEF = re.compile(r"^def (\w+)\((.*)\)\s*(?:->\s*[^:]+)?:\s*(?:#\s*(.*))?$", re.M)
+#: A declaration's Python type as the JSON schema type it stands for (others: any value).
+_JSON_TYPES = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+}
+
+
+def listed_tool(tool: dict[str, Any]) -> ToolDef:
+    """One ``tools/list`` entry (not a meta-tool) as a :class:`ToolDef`."""
+    name = str(tool["name"])
+    hints = None
+    if isinstance(tool.get("annotations"), dict):
+        with suppress(ValidationError):  # a server's malformed hints are no hints
+            parsed = ToolAnnotations.model_validate(tool["annotations"])
+            hints = parsed if parsed.model_fields_set else None
+    schema = tool.get("inputSchema")
+    return ToolDef(
+        name=name,
+        client=name.split(TOOL_SEPARATOR, 1)[0],
+        description=str(tool.get("description") or ""),
+        parameters=dict(schema) if isinstance(schema, dict) else {},
+        annotations=hints,
+    )
+
+
+def server_files(text: str) -> list[str]:
+    """The Code Mode clients ``listToolFiles`` names (one ``<client>.pyi`` each)."""
+    return list(dict.fromkeys(_SERVER_FILE.findall(text)))
+
+
+def declared_tools(client: str, text: str) -> list[ToolDef]:
+    """A Code Mode client's tools from its ``readToolFile`` declarations. The parameters are
+    the signature's, as JSON schema (a type outside ``str``/``int``/``float``/``bool``/
+    ``list``/``dict`` admits any value; one with a default is optional); the description is
+    the declaration's comment, which the gateway may truncate."""
+    tools = []
+    for name, params, comment in _DEF.findall(text):
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for param in _split(params):
+            head, _, default = param.partition("=")
+            pname, _, ptype = head.partition(":")
+            pname = pname.strip().lstrip("*")
+            if not pname:
+                continue
+            base = ptype.strip().split("[", 1)[0].strip()
+            properties[pname] = {"type": _JSON_TYPES[base]} if base in _JSON_TYPES else {}
+            if not default.strip():
+                required.append(pname)
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        tools.append(
+            ToolDef(
+                name=f"{client}{TOOL_SEPARATOR}{name}",
+                client=client,
+                description=comment.strip(),
+                parameters=schema,
+                code_mode=True,
+            )
+        )
+    return tools
+
+
+def _split(params: str) -> list[str]:
+    """A signature's parameters, split on the commas outside brackets."""
+    parts, depth, current = [], 0, ""
+    for char in params:
+        if char in "[(":
+            depth += 1
+        elif char in "])":
+            depth -= 1
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    return [p for p in (*parts, current) if p.strip()]
+
+
 class MCP(Resource):
     """``bf.mcp`` — list and manage the gateway's MCP clients."""
 
     async def clients(self) -> list[MCPClient]:
-        """Every registered client, across all pages, with its tools' annotations."""
-        return (await self._clients())[0]
-
-    async def _clients(self) -> tuple[list[MCPClient], frozenset[str] | None]:
-        """The clients, and the ``<client>-<tool>`` names the gateway's MCP endpoint lists for
-        this client's key (``None`` when that endpoint could not be asked)."""
+        """Every registered client, across all pages, with its tools' annotations (an admin
+        listing: with admin auth on it needs ``admin_token``; :meth:`Bifrost.tools` is what a
+        virtual key may list)."""
         entries: list[dict[str, Any]] = []
         while True:
             page = await self._api.items(
@@ -245,8 +340,7 @@ class MCP(Resource):
                 break
         listed = await self._listing() if any(e.get("tools") for e in entries) else {}
         annotations = {name: hints for name, hints in (listed or {}).items() if hints is not None}
-        clients = [MCPClient._from_gateway(entry, annotations) for entry in entries]
-        return clients, None if listed is None else frozenset(listed)
+        return [MCPClient._from_gateway(entry, annotations) for entry in entries]
 
     async def _listing(self) -> dict[str, ToolAnnotations | None] | None:
         """``<client>-<tool>`` → annotations, from the gateway's MCP ``tools/list``.
@@ -265,17 +359,11 @@ class MCP(Resource):
         tools = result.get("tools") if isinstance(result, dict) else None
         if not isinstance(tools, list):
             return None
-        found: dict[str, ToolAnnotations | None] = {}
-        for tool in tools:
-            if not isinstance(tool, dict) or "name" not in tool:
-                continue
-            hints = None
-            if isinstance(tool.get("annotations"), dict):
-                with suppress(ValidationError):  # a server's malformed hints are no hints
-                    parsed = ToolAnnotations.model_validate(tool["annotations"])
-                    hints = parsed if parsed.model_fields_set else None
-            found[str(tool["name"])] = hints
-        return found
+        return {
+            str(t["name"]): listed_tool(t).annotations
+            for t in tools
+            if isinstance(t, dict) and "name" in t
+        }
 
     async def add(self, config: MCPClientConfig) -> None:
         """Register a client. Refused by the gateway for private-network targets unless the
