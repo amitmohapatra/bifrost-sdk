@@ -41,8 +41,9 @@ TOOL_SEPARATOR = "-"
 ALL = "*"
 #: The gateway's maximum page size for ``GET /api/mcp/clients``.
 _PAGE = 100
-#: The gateway's own MCP server: the one listing that carries tool annotations.
-_MCP_ENDPOINT = "/mcp"
+#: The gateway's own MCP server (a sibling of ``/v1``): the one listing a virtual key may ask
+#: for, and the one that carries tool annotations.
+MCP_ENDPOINT = "/mcp"
 
 
 class _Frozen(BaseModel):
@@ -352,7 +353,7 @@ class MCP(Resource):
         """
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
         try:
-            payload = await self._api.post(_MCP_ENDPOINT, request)
+            payload = await self._api.post(MCP_ENDPOINT, request)
         except GatewayError:
             return None
         result = payload.get("result") if isinstance(payload, dict) else None

@@ -10,6 +10,7 @@ import json as jsonlib
 
 import httpx
 import pytest
+import respx
 
 from bifrost_sdk import (
     Bifrost,
@@ -20,6 +21,7 @@ from bifrost_sdk import (
     RateLimited,
     Unreachable,
 )
+from bifrost_sdk import _breaker as breaker_module
 from bifrost_sdk._retry import retry_after
 from bifrost_sdk.headers import Options
 
@@ -742,7 +744,7 @@ async def test_a_spent_retry_budget_counts_once_not_once_per_attempt() -> None:
             await bf.chat("hi")
     assert calls["n"] == 6, "two calls, three attempts each"
     assert bf._breaker.consecutive_failures == 2
-    assert not bf._breaker.is_open
+    bf._breaker.check()  # still closed: raises CircuitOpen otherwise
 
 
 async def test_threshold_zero_disables_the_breaker() -> None:
@@ -752,3 +754,419 @@ async def test_threshold_zero_disables_the_breaker() -> None:
         with pytest.raises(GatewayError):
             await bf.chat("hi")
     assert calls["n"] == 4
+
+
+async def test_the_breaker_lets_a_call_through_once_the_open_window_has_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open is a pause, not a verdict: after ``circuit_open_seconds`` the next call is sent."""
+    now = {"t": 1000.0}
+    monkeypatch.setattr(breaker_module, "time", type("Clock", (), {"monotonic": lambda: now["t"]}))
+    state = {"fail": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500) if state["fail"] else reply("back")
+
+    bf = client(handler, max_retries=0, circuit_failure_threshold=1, circuit_open_seconds=30.0)
+    with pytest.raises(GatewayError):
+        await bf.chat("hi")
+    now["t"] += 29.0
+    with pytest.raises(CircuitOpen) as caught:
+        await bf.chat("hi")
+    assert caught.value.retry_after == 1.0
+    assert caught.value.details["failures"] == 1
+    now["t"] += 1.5
+    state["fail"] = False
+    assert await bf.chat("hi") == "back"
+    await bf.aclose()
+
+
+# ------------------------------------------------- the clients Bifrost builds for itself
+#
+# Every other test hands Bifrost a mocked httpx client. These let it build its own, as an
+# application does, and intercept the wire with respx (whose router fails a test on any
+# unmocked request or unused route) — so what is asserted is what a real gateway would get.
+
+KEY = "vk-placeholder"
+ADMIN_TOKEN = "admin-token-placeholder"
+
+
+async def test_the_virtual_key_is_the_bearer_on_inference_and_mcp(
+    respx_mock: respx.MockRouter,
+) -> None:
+    chat = respx_mock.post("http://gateway.test/v1/chat/completions").mock(return_value=reply("ok"))
+    listing = respx_mock.post("http://gateway.test/mcp").mock(
+        return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
+    )
+    bf = Bifrost("http://gateway.test/v1/", model="m", api_key=KEY)
+    assert await bf.chat("hi") == "ok"
+    assert await bf.tools() == []
+    for route in (chat, listing):
+        request = route.calls.last.request
+        assert request.headers["Authorization"] == f"Bearer {KEY}"
+        assert request.headers["Content-Type"] == "application/json"
+    await bf.aclose()
+    assert bf._client.is_closed and bf._admin.is_closed, "it closes what it opened"
+
+
+async def test_the_admin_token_replaces_the_key_on_api_routes_only(
+    respx_mock: respx.MockRouter,
+) -> None:
+    chat = respx_mock.post("http://gateway.test/v1/chat/completions").mock(return_value=reply("ok"))
+    remove = respx_mock.delete("http://gateway.test/api/mcp/client/id-erp").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    bf = Bifrost("http://gateway.test/v1", model="m", api_key=KEY, admin_token=ADMIN_TOKEN)
+    await bf.chat("hi")
+    await bf.mcp.remove("id-erp")
+    assert chat.calls.last.request.headers["Authorization"] == f"Bearer {KEY}"
+    assert remove.calls.last.request.headers["Authorization"] == f"Bearer {ADMIN_TOKEN}"
+    await bf.aclose()
+
+
+async def test_without_a_key_no_authorization_is_sent(respx_mock: respx.MockRouter) -> None:
+    """A gateway with governance off takes anonymous calls; an empty bearer would be refused."""
+    chat = respx_mock.post("http://gateway.test/v1/chat/completions").mock(return_value=reply("ok"))
+    async with Bifrost("http://gateway.test/v1", model="m") as bf:
+        await bf.chat("hi")
+    assert "Authorization" not in chat.calls.last.request.headers
+
+
+@pytest.mark.parametrize(("total", "connect"), [(60.0, 5.0), (2.0, 2.0)])
+async def test_the_connect_timeout_is_capped_by_the_overall_one(
+    total: float, connect: float
+) -> None:
+    """A gateway that does not accept a connection in five seconds is down; a client given
+    less than that in total must not wait longer just to connect."""
+    async with Bifrost("http://gateway.test/v1", model="m", timeout=total) as bf:
+        for http in (bf._client, bf._admin):
+            assert (http.timeout.read, http.timeout.connect) == (total, connect)
+
+
+# ----------------------------------------------------------------- stream failure modes
+
+
+async def test_a_stream_error_status_raises_once_with_its_body() -> None:
+    """Streams are not retried: the first error status is the answer."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, text="upstream overloaded")
+
+    bf = client(handler, max_retries=3)
+    with pytest.raises(GatewayError) as caught:
+        [d async for d in bf.stream("hi")]
+    assert caught.value.details == {"status": 503, "body": "upstream overloaded"}
+    assert calls["n"] == 1
+    await bf.aclose()
+
+
+async def test_a_rate_limited_stream_is_a_rate_limit() -> None:
+    bf = client(lambda r: httpx.Response(429, headers={"Retry-After": "3"}))
+    with pytest.raises(RateLimited) as caught:
+        [d async for d in bf.stream("hi")]
+    assert caught.value.retry_after == 3.0
+    await bf.aclose()
+
+
+async def test_a_stream_skips_everything_that_is_not_text() -> None:
+    """Keep-alive comments, event lines, role-only and empty deltas, a malformed chunk: none
+    of them is text, and a stream that ends without ``[DONE]`` simply ends."""
+    body = (
+        ": keep-alive\n\n"
+        "event: message\n"
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        "data: {not json\n\n"
+        'data: {"choices":[]}\n\n'
+        'data: {"choices":[{"delta":{"content":""}}]}\n\n'
+        'data:{"choices":[{"delta":{"content":"ok"}}]}\n\n'
+    )
+    bf = client(lambda r: httpx.Response(200, text=body))
+    assert [d async for d in bf.stream("hi")] == ["ok"]
+    await bf.aclose()
+
+
+async def test_a_stream_sends_the_opinionated_body_with_stream_on() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = jsonlib.loads(request.content)
+        return httpx.Response(200, text="data: [DONE]\n\n")
+
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+    bf = client(handler, max_tokens=64)
+    assert [d async for d in bf.stream("hi", tools=tools, temperature=0.7, top_p=0.9)] == []
+    assert seen["path"] == "/v1/chat/completions"
+    assert seen["body"] == {
+        "model": "test/model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 64,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "tools": tools,
+        "stream": True,
+    }
+    await bf.aclose()
+
+
+async def test_a_stream_that_cannot_connect_is_unreachable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no bytes")
+
+    bf = client(handler)
+    with pytest.raises(Unreachable, match="ReadTimeout"):
+        [d async for d in bf.stream("hi")]
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- retry schedule
+
+
+def _sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the waits between attempts instead of sleeping them."""
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr("bifrost_sdk._client.asyncio.sleep", sleep)
+    return waits
+
+
+def _then(*responses: httpx.Response):
+    """A handler answering ``responses`` in order, counting the requests it saw."""
+    queue = list(responses)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return queue.pop(0)
+
+    return handler, calls
+
+
+async def test_without_advice_the_wait_doubles_each_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits = _sleeps(monkeypatch)
+    handler, calls = _then(httpx.Response(502), httpx.Response(504), reply("ok"))
+    bf = client(handler, max_retries=2, backoff_seconds=0.5)
+    assert await bf.chat("hi") == "ok"
+    assert waits == [0.5, 1.0]
+    assert calls["n"] == 3
+    await bf.aclose()
+
+
+async def test_a_rate_limits_own_delay_replaces_the_backoff_but_never_exceeds_a_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits = _sleeps(monkeypatch)
+    handler, _ = _then(
+        httpx.Response(429, headers={"Retry-After": "300"}),
+        httpx.Response(429, text="Please retry in 2.5s"),
+        reply("ok"),
+    )
+    bf = client(handler, max_retries=2, backoff_seconds=0.5)
+    assert await bf.chat("hi") == "ok"
+    assert waits == [60.0, 2.5]
+    await bf.aclose()
+
+
+async def test_no_wait_follows_the_last_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    waits = _sleeps(monkeypatch)
+    handler, calls = _then(httpx.Response(500), httpx.Response(500))
+    bf = client(handler, max_retries=1, backoff_seconds=0.25)
+    with pytest.raises(GatewayError):
+        await bf.chat("hi")
+    assert (calls["n"], waits) == (2, [0.25])
+    await bf.aclose()
+
+
+async def test_timeouts_are_retried_and_then_reported_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _sleeps(monkeypatch)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ReadTimeout("slow")
+
+    bf = client(handler, max_retries=2)
+    with pytest.raises(Unreachable, match="ReadTimeout"):
+        await bf.complete("hi")
+    assert calls["n"] == 3
+    assert bf._breaker.consecutive_failures == 1
+    await bf.aclose()
+
+
+async def test_a_timeout_then_success_is_a_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _sleeps(monkeypatch)
+    answers: list[object] = [httpx.ConnectTimeout("slow"), reply("ok")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    bf = client(handler, max_retries=1)
+    assert await bf.chat("hi") == "ok"
+    assert bf._breaker.consecutive_failures == 0
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- reading the reply
+
+
+async def test_a_non_json_200_is_a_gateway_fault_counted_by_the_breaker() -> None:
+    handler, calls = _then(httpx.Response(200, text="<!doctype html>"))
+    bf = client(handler, max_retries=3)
+    with pytest.raises(GatewayError, match="non-JSON"):
+        await bf.chat("hi")
+    assert calls["n"] == 1, "a 200 is not retried, however unusable"
+    assert bf._breaker.consecutive_failures == 1
+    await bf.aclose()
+
+
+@pytest.mark.parametrize("payload", [{}, {"choices": []}, {"choices": None}])
+async def test_a_reply_without_choices_is_a_gateway_error(payload) -> None:
+    bf = client(lambda r: httpx.Response(200, json=payload))
+    with pytest.raises(GatewayError, match="no choices"):
+        await bf.chat("hi")
+    await bf.aclose()
+
+
+async def test_content_parts_are_joined_into_text() -> None:
+    parts = [{"type": "text", "text": "Hel"}, {"type": "image_url"}, "noise", {"text": "lo"}]
+    bf = client(lambda r: reply(parts))
+    assert await bf.chat("hi") == "Hello"
+    await bf.aclose()
+
+
+async def test_no_text_that_did_not_run_out_of_budget_is_an_empty_string() -> None:
+    """A tool-call turn has no text and that is the answer, not a failure."""
+    bf = client(lambda r: reply(None, finish="tool_calls"))
+    assert await bf.chat("hi") == ""
+    await bf.aclose()
+
+
+async def test_an_empty_answer_carries_the_token_counts() -> None:
+    usage = {"completion_tokens": 32, "completion_tokens_details": {"reasoning_tokens": 30}}
+    bf = client(lambda r: reply("", finish="length", usage=usage))
+    with pytest.raises(EmptyResponse) as caught:
+        await bf.chat("hi")
+    assert caught.value.details == {"completion_tokens": 32, "reasoning_tokens": 30}
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("here: {not: json}", "is not JSON"),
+        ("} backwards {", "is not JSON"),
+        ("[1, 2]", "not a JSON object"),
+    ],
+)
+async def test_json_refuses_what_is_not_one_object(text: str, message: str) -> None:
+    bf = client(lambda r: reply(text))
+    with pytest.raises(InvalidJSON, match=message) as caught:
+        await bf.json("x")
+    assert caught.value.details["body"] == text
+    await bf.aclose()
+
+
+async def test_json_sends_the_schema_as_a_strict_response_format() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(jsonlib.loads(request.content))
+        return reply('{"a": 1}')
+
+    schema = {"type": "object", "properties": {"a": {"type": "integer"}}}
+    bf = client(handler)
+    await bf.json("x", schema=schema, system="extract")
+    assert seen["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "schema": schema, "strict": True},
+    }
+    assert seen["messages"][0] == {"role": "system", "content": "extract"}
+    await bf.aclose()
+
+
+async def test_json_without_a_schema_sends_no_response_format() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(jsonlib.loads(request.content))
+        return reply('{"a": 1}')
+
+    bf = client(handler)
+    assert await bf.json("x") == {"a": 1}
+    assert "response_format" not in seen
+    await bf.aclose()
+
+
+async def test_a_message_list_is_sent_as_given_after_the_system_turn() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(jsonlib.loads(request.content))
+        return reply("ok")
+
+    turns = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    bf = client(handler)
+    await bf.complete(turns, system="s", max_tokens=10, temperature=0.2, seed=7)
+    assert seen == {
+        "model": "test/model",
+        "messages": [{"role": "system", "content": "s"}, *turns],
+        "max_tokens": 10,
+        "temperature": 0.2,
+        "seed": 7,
+    }
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- the rest of Options
+
+
+def test_every_remaining_option_has_its_header() -> None:
+    """The fields the verb-level test does not send: governance, cache, project, MCP session."""
+    assert Options(
+        virtual_key="vk-placeholder",
+        mcp_session_id="mcp-s",
+        cache_key="k",
+        cache_type="semantic",
+        cache_threshold=0.9,
+        project_id="proj",
+    ).headers() == {
+        "x-bf-vk": "vk-placeholder",
+        "x-bf-mcp-session-id": "mcp-s",
+        "x-bf-cache-key": "k",
+        "x-bf-cache-type": "semantic",
+        "x-bf-cache-threshold": "0.9",
+        "x-bf-project-id": "proj",
+    }
+
+
+def test_a_prompt_without_a_version_selects_the_latest_committed_one() -> None:
+    assert Options(prompt_id="p").headers() == {"x-bf-prompt-id": "p"}
+
+
+def test_extra_headers_are_applied_last() -> None:
+    """``extra`` is the escape hatch: it may override a header the fields produced."""
+    options = Options(session_id="s", extra={"x-bf-session-id": "override"})
+    assert options.headers() == {"x-bf-session-id": "override"}
+
+
+def test_a_retry_after_date_without_a_zone_is_read_as_utc() -> None:
+    value = retry_after({"retry-after": "Wed, 21 Oct 2099 07:28:00 -0000"})
+    assert value is not None and value > 0
+    assert retry_after({"retry-after": "Wed, 21 Oct 1999 07:28:00 -0000"}) == 0.0
+
+
+def test_an_unreadable_header_falls_back_to_the_body() -> None:
+    assert retry_after({"retry-after": "soon"}, "Please retry in 4s.") == 4.0
+    assert retry_after({"retry-after": "-5"}) == 0.0, "a negative delay is no delay"

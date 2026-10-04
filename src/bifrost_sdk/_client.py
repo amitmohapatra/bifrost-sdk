@@ -40,6 +40,7 @@ from bifrost_sdk._errors import (
 from bifrost_sdk._mcp import (
     CODE_MODE_META_TOOLS,
     MCP,
+    MCP_ENDPOINT,
     MCPLog,
     ToolDef,
     declared_tools,
@@ -53,8 +54,6 @@ from bifrost_sdk.headers import Options
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
 
-#: The gateway's own MCP server (a sibling of ``/v1``), the listing a virtual key may ask for.
-MCP_ENDPOINT = "/mcp"
 #: The gateway's maximum page size for ``GET /api/mcp-logs``.
 MAX_LOG_PAGE = 1000
 
@@ -385,10 +384,10 @@ class Bifrost:
 
         Success, not merely "answered". It used to accept anything below 500, which makes
         the check unable to fail in the one case it exists for: a ``base_url`` pointing at
-        something that is not this gateway. That is not hypothetical — the default here is
-        ``localhost:8090/v1``, and on the machine this was written on a *different* service
-        held port 8090 and answered 404, so a misconfigured deployment reported its model
-        dependency healthy and failed on every actual call.
+        something that is not this gateway. That is not hypothetical — the memory service's
+        default was ``localhost:8090/v1``, and on the machine this was written on a
+        *different* service held port 8090 and answered 404, so a misconfigured deployment
+        reported its model dependency healthy and failed on every actual call.
 
         A 401 or 404 on ``/models`` means the same request to ``/chat/completions``, which
         is all this client ever sends, will not work either. Reporting that as up is worse

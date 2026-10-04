@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # The dev tools are the `dev` extra, not a dependency group: --all-extras installs them.
+      - run: uv sync --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # Unit tests only: the gateway is mocked, nothing touches the network. The live tests
+      # skip without BIFROST_LIVE_URL, which CI does not set.
+      - run: uv run pytest -q
