@@ -11,6 +11,66 @@ skills.
 
 How the pieces fit, with diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Where this fits: two ways to use Trellis
+
+Trellis is used in one of two ways, and each block works in both:
+
+- **Way 1, wrapped.** `from trellis import Harness; h = Harness(); agent = h.wrap(my_agent)`.
+  The harness runs your agent (LangGraph, Deep Agents, OpenAI Agents SDK, Claude Agent SDK,
+  a plain function) and uses every block automatically: memory context, recording and
+  feedback; durable runs, the inbox, schedules and the worker in agent-runs; governance of
+  tool calls; models and MCP tools through Bifrost; evals; the AG-UI and A2A surfaces.
+- **Way 2, pluggable blocks.** Keep your framework untouched and import only the blocks you
+  want: `trellis.memory` (`MemoryClient`), `trellis.runs` (`RunsClient`, `Worker`,
+  `webhooks.verify_signature`), `trellis.contracts` (the shared types), `bifrost_sdk` (models
+  and MCP tools through Bifrost), and from the harness repo `trellis.harness.governance`
+  (`Governance.from_env`, `check`, `governed`), `trellis.harness.evals` (`EvalServices`,
+  `evaluate`, `judge`) and `trellis.harness.a2a.remote`.
+
+A package shipped from its own repo is top-level `trellis.X`; anything from the harness repo
+is `trellis.harness.X`. `bifrost_sdk` (pip `bifrost-sdk`) is the exception: it keeps its own,
+older name.
+
+**This package** is `bifrost_sdk`, the client every model call and every MCP tool call on the
+platform goes through: the gateway holds the provider keys and the MCP servers, and this
+client knows a URL, a virtual key and a model name. It reads no environment variables and
+imports neither `trellis.contracts` nor any agent framework.
+
+| | What happens with `bifrost_sdk` |
+|---|---|
+| **Way 1, wrapped** | With `BIFROST_URL` and `BIFROST_VIRTUAL_KEY` set, the harness lists the MCP tools the key allows (`tools()`), runs each call the model makes with `execute_tool` once governance lets it, reads a Code Mode script's nested calls back with `mcp_logs`, and calls `complete` for its `ReAct` loop and its LLM judge. The memory service makes its own model calls through it as well. You write no Bifrost code; a framework's own model object points at the gateway's OpenAI-compatible endpoint. |
+| **Way 2, pluggable** | Your framework runs the agent, untouched; you list the key's MCP tools, offer them to the model and run the calls it makes: |
+
+```python
+from bifrost_sdk import Bifrost
+
+async with Bifrost(BIFROST_URL, model=MODEL, api_key=VIRTUAL_KEY) as bf:
+    tools = await bf.tools()  # the MCP tools this virtual key may run
+    offered = [
+        {
+            "type": "function",
+            "function": {"name": t.name, "description": t.description, "parameters": t.parameters},
+        }
+        for t in tools
+    ]
+    reply = await bf.complete(question, tools=offered)
+    for call in reply["choices"][0]["message"].get("tool_calls") or []:
+        turn = await bf.execute_tool(call)  # after your own check, e.g. trellis.harness.governance
+```
+
+- **Choose Way 1 when** you want the gateway's MCP tools offered, governed, run and recorded
+  on every run of a wrapped agent with no code.
+- **Choose Way 2 when** your framework already owns the model loop and you want the gateway
+  behind it: run each tool call through `trellis.harness.governance` (`Governance.check`, or
+  `governed` around the call) before `execute_tool`. Or when you are building on the gateway
+  rather than an agent: `chat`, `json` and `stream`, and `Admin` for virtual keys, budgets and
+  routing ([Which method, when](#which-method-when)).
+
+Harness docs: [the two ways](https://github.com/amitmohapatra/agent-harness/blob/main/README.md#two-ways-to-use-trellis) · [every page](https://github.com/amitmohapatra/agent-harness/blob/main/docs/README.md) ·
+blocks: [governance](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/governance.md), [evaluation](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/evaluation.md), [contracts](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/contracts.md) ·
+recipes: [LangGraph](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/langgraph.md), [OpenAI Agents SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/openai-agents.md),
+[Claude Agent SDK](https://github.com/amitmohapatra/agent-harness/blob/main/docs/blocks/claude-agent-sdk.md).
+
 ## Install
 
 ```bash
@@ -88,7 +148,7 @@ process that serves several callers through one client.
 | show text as it is generated (time-to-first-token matters) | `bf.stream(prompt)` | `AsyncIterator[str]` |
 | build a framework on the gateway: usage, `tool_calls`, `finish_reason`, only the keys you set | `bf.complete(prompt)` | `dict` (the gateway's response) |
 | know which MCP tools this key may run, to offer them to a model | `bf.tools(clients, only)` | `list[ToolDef]` |
-| run a tool call the model asked for, after your own policy check | `bf.execute_tool(tool_call)` | `dict` (`{"role": "tool", …}`) |
+| run a tool call the model asked for, after your own policy check (in Trellis, `trellis.harness.governance`; a wrapped agent's harness does both) | `bf.execute_tool(tool_call)` | `dict` (`{"role": "tool", …}`) |
 | read back what tools ran (e.g. a Code Mode script's nested calls) | `bf.mcp_logs(since, parent_request_id=...)` | `list[MCPLog]` |
 | check readiness (health probe) | `bf.ping()` | `bool`, never raises |
 | see every registered MCP server and all its tools (admin) | `bf.mcp.clients()` | `list[MCPClient]` |
