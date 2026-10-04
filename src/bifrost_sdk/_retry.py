@@ -6,16 +6,23 @@ each implemented them wrong in the same way.
 
 from __future__ import annotations
 
+import random
 import re
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, Protocol
 
 #: Statuses where the same request may succeed later. Everything else is the caller's
 #: mistake, and retrying it only spends the budget. Public, because a caller wrapping this
 #: client needs to tell "we gave up after retrying" apart from "we never tried" when it
 #: reports a failure, and re-deriving the set is how the two copies of it drifted.
 RETRYABLE = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+#: The longest wait between two attempts, whoever chose it. A ``Retry-After`` beyond it is
+#: honoured only up to here: a caller holding a request for minutes on a gateway's say-so is
+#: worse off than one that fails and decides for itself, and every client in the platform
+#: (the harness's runs client, the memory SDK) caps at the same thirty seconds.
+MAX_WAIT = 30.0
 
 #: Some providers put the delay in the error *body* rather than the header — Gemini answers
 #: "Please retry in 59.18s". A client that only reads the header sees nothing and falls back
@@ -46,6 +53,26 @@ def retry_after(headers: Any = None, body: str = "") -> float | None:
     return float(match.group(1)) if match else None
 
 
-def backoff(attempt: int, base: float) -> float:
-    """Exponential backoff for failures that carry no advice of their own."""
-    return base * (2**attempt)
+class Jitter(Protocol):
+    """Anything with ``random.Random.random``: a seeded generator in tests, the shared one
+    otherwise."""
+
+    def random(self) -> float: ...
+
+
+#: The process's jitter source. Not a security boundary, only a way to spread callers out.
+_JITTER = random.Random()
+
+
+def backoff(attempt: int, base: float, rng: Jitter | None = None) -> float:
+    """Exponential backoff with full jitter, for failures that carry no advice of their own.
+
+    A uniform draw from ``[0, min(MAX_WAIT, base * 2**attempt))``. The bare exponential was
+    the same number in every process: when a gateway restarts, every agent that failed in
+    the same second retries in the same second, and the stampede is the next outage. Full
+    jitter spreads the retries across the whole window — the lowest total load of the
+    standard schemes, at the price of an occasional retry that comes sooner than the
+    exponential would have.
+    """
+    ceiling = min(MAX_WAIT, base * (2**attempt))
+    return (rng or _JITTER).random() * ceiling

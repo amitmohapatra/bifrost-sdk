@@ -1,10 +1,13 @@
-"""Against a running gateway. Opt-in: set ``BIFROST_LIVE_URL`` (e.g. ``http://localhost:8091/v1``).
+"""Against a running gateway. Opt-in: ``pytest -m live`` with ``BIFROST_URL`` set (e.g.
+``http://localhost:8091/v1``) — the name every other repository in the platform uses for the
+gateway. ``BIFROST_LIVE_URL`` is still read when ``BIFROST_URL`` is unset, as an alias.
 
 Registers temporary MCP clients (``BIFROST_LIVE_MCP_URL``, default the public DeepWiki
 server — the gateway refuses private-network targets to unauthenticated callers; and
 ``BIFROST_LIVE_ANNOTATED_MCP_URL``, default the public Context7 server, which publishes MCP
-tool annotations) and removes them afterwards. Skipped when the variable is unset or the
-gateway is unreachable.
+tool annotations) and removes them afterwards. Skipped when neither variable is set or the
+gateway is unreachable. Deselected by a plain ``pytest`` (``addopts`` in ``pyproject.toml``):
+``BIFROST_URL`` is set in shells that never meant to register clients on that gateway.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from bifrost_sdk.admin import Admin
 
 pytestmark = pytest.mark.live
 
-LIVE_URL = os.environ.get("BIFROST_LIVE_URL")
+LIVE_URL = os.environ.get("BIFROST_URL") or os.environ.get("BIFROST_LIVE_URL")
 MCP_URL = os.environ.get("BIFROST_LIVE_MCP_URL", "https://mcp.deepwiki.com/mcp")
 ANNOTATED_MCP_URL = os.environ.get("BIFROST_LIVE_ANNOTATED_MCP_URL", "https://mcp.context7.com/mcp")
 #: A tool the default server exposes, and one it exposes that the client will not allow.
@@ -46,7 +49,7 @@ async def _eventually(probe):
 @pytest.fixture
 async def bf() -> AsyncIterator[Bifrost]:
     if not LIVE_URL:
-        pytest.skip("BIFROST_LIVE_URL not set")
+        pytest.skip("BIFROST_URL (or BIFROST_LIVE_URL) not set")
     client = Bifrost(LIVE_URL)
     if not await client.ping():
         await client.aclose()

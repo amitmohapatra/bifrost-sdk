@@ -19,5 +19,5 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       # Unit tests only: the gateway is mocked, nothing touches the network. The live tests
-      # skip without BIFROST_LIVE_URL, which CI does not set.
+      # are deselected by default (pyproject addopts) and skip without BIFROST_URL anyway.
       - run: uv run pytest -q

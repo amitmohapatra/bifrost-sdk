@@ -6,6 +6,7 @@ Listing payloads are shaped like the running gateway's ``GET /api/mcp/clients`` 
 
 from __future__ import annotations
 
+import asyncio
 import json as jsonlib
 from datetime import UTC, datetime
 
@@ -22,10 +23,12 @@ from bifrost_sdk import (
     MCPLog,
     Options,
     RateLimited,
+    ServerError,
     ToolAnnotations,
     ToolDef,
     Unreachable,
 )
+from bifrost_sdk._client import CODE_MODE_READS
 from bifrost_sdk._mcp import declared_tools
 
 BASE = "http://gateway.test/v1"
@@ -841,3 +844,51 @@ def test_tool_annotations_parse_from_either_spelling() -> None:
     python = ToolAnnotations(read_only_hint=True, open_world_hint=False)
     assert wire == python
     assert (python.destructive_hint, python.idempotent_hint) == (None, None)
+
+
+def code_mode_gateway(clients: list[str], *, failing: frozenset[str] = frozenset()):
+    """A gateway whose ``readToolFile`` answers take longer the earlier the client is listed
+    (so the reads finish in reverse order), recording how many were in flight at once."""
+    state = {"in_flight": 0, "peak": 0}
+
+    async def handler(request):
+        body = jsonlib.loads(request.content)
+        if body["method"] == "tools/list":
+            return rpc_tools([{"name": "listToolFiles"}, {"name": "readToolFile"}])
+        call = body["params"]
+        if call["name"] == "listToolFiles":
+            text = "servers/" + "".join(f"\n  {c}.pyi" for c in clients)
+        else:
+            name = call["arguments"]["fileName"].removeprefix("servers/").removesuffix(".pyi")
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+            await asyncio.sleep(0.002 * (len(clients) - clients.index(name)))
+            state["in_flight"] -= 1
+            if name in failing:
+                return httpx.Response(503, text=f"{name} down")
+            text = f"def lookup_{name}() -> dict:  # {name}."
+        result = {"content": [{"type": "text", "text": text}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    return state, handler
+
+
+async def test_code_mode_files_are_read_concurrently_bounded_and_in_listed_order() -> None:
+    clients = [f"c{i}" for i in range(9)]
+    state, handler = code_mode_gateway(clients)
+    bf = client(handler)
+    tools = await bf.tools()
+    assert names(tools) == [f"{c}-lookup_{c}" for c in clients]
+    assert 1 < state["peak"] <= CODE_MODE_READS
+    await bf.aclose()
+
+
+async def test_a_failed_code_mode_read_fails_the_listing_with_the_first_listed_failure() -> None:
+    """The later-listed failure finishes first; the one raised is still the earlier-listed."""
+    clients = ["a", "b", "c", "d"]
+    _, handler = code_mode_gateway(clients, failing=frozenset({"b", "d"}))
+    bf = client(handler)
+    with pytest.raises(ServerError) as caught:
+        await bf.tools()
+    assert caught.value.details["body"] == "b down"
+    await bf.aclose()

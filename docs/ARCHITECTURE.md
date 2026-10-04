@@ -67,10 +67,10 @@ flowchart TB
     client["_client.py<br/>Bifrost, Messages"]
     mcp["_mcp.py<br/>MCP resource · MCPClient · MCPClientConfig<br/>MCPConnection · ToolDef · ToolAnnotations · MCPLog<br/>tools/list and Code Mode parsing · scope()"]
     headers["headers.py<br/>Options · x-bf-* constants"]
-    api["_api.py<br/>ManagementAPI (JSON over /api) · Resource<br/>management_client · origin"]
-    retry["_retry.py<br/>RETRYABLE · retry_after() · backoff()"]
-    errors["_errors.py<br/>BifrostError hierarchy · from_response()"]
-    breaker["_breaker.py<br/>Breaker"]
+    api["_api.py<br/>ManagementAPI (JSON over /api) · Resource<br/>management_client · origin<br/>limits() · timeouts()"]
+    retry["_retry.py<br/>RETRYABLE · MAX_WAIT · retry_after() · backoff() (full jitter)"]
+    errors["_errors.py<br/>BifrostError hierarchy · typed status errors · from_response()"]
+    breaker["_breaker.py<br/>Breaker · counts()"]
     adminpkg["admin/<br/>Admin · VirtualKeys · Governance<br/>Routing · Prompts · Skills"]
 
     init --> client
@@ -94,13 +94,16 @@ flowchart TB
 
 - `Bifrost` holds two httpx clients: one rooted at `base_url` (`/v1`, plus `/mcp` on the
   same origin) that carries the virtual key, and one rooted at the origin for `/api/*` that
-  carries the admin token. `Admin` holds only the second kind.
+  carries the admin token. `Admin` holds only the second kind. Every client the package
+  builds gets `_api.limits()` (at most 100 connections, 20 idle kept for 30 s) and
+  `_api.timeouts()` (connect `min(5, timeout)`; read, write and pool `timeout`).
 - Everything under `/api/*` goes through `ManagementAPI`: one request, no retries, the shared
   error mapping, envelope unwrapping for list endpoints. `MCP` and each admin namespace are a
   `Resource` bound to it.
 - `_errors.from_response` is the one place an error status becomes an exception: 429 is
-  `RateLimited` (with the delay from `_retry.retry_after`), anything else at or above 400 is
-  `GatewayError`. Transport failures become `Unreachable`.
+  `RateLimitedError` (with the delay from `_retry.retry_after`), 400/401/403/404/409/422 and
+  5xx have a `GatewayError` subclass each, and any other status at or above 400 is a plain
+  `GatewayError`. Transport failures become `Unreachable`. See [Errors](#errors).
 
 ## A chat completion with a virtual key
 
@@ -127,14 +130,14 @@ sequenceDiagram
         GW->>GOV: is this model allowed for the key? budget? rate limit?
         alt key refuses (a status not in RETRYABLE)
             GOV-->>SDK: 4xx
-            SDK->>BR: record_failure()
-            SDK-->>App: GatewayError(status, body) — not retried
+            SDK->>BR: record_failure(error) — a 4xx is not counted
+            SDK-->>App: BadRequestError, PermissionDeniedError, ... — not retried
         else rate limited
             GOV-->>SDK: 429 (Retry-After header or "retry in Ns" in the body)
-            SDK->>SDK: sleep min(retry_after, 60s), then retry
+            SDK->>SDK: sleep min(retry_after, 30s), no jitter, then retry
         else 5xx / 408 / timeout / connection error
             GOV-->>SDK: retryable failure
-            SDK->>SDK: sleep backoff_seconds * 2^attempt (capped at 60s), then retry
+            SDK->>SDK: sleep uniform(0, min(30s, backoff_seconds * 2^attempt)), then retry
         else allowed
             GOV->>P: routed request (rule may pick another model)
             P-->>GW: completion
@@ -148,12 +151,51 @@ sequenceDiagram
             end
         end
     end
-    Note over SDK,BR: retries spent: record_failure() once (a no-op for RateLimited), raise the last error
+    Note over SDK,BR: retries spent: record_failure() once (counted for 5xx and transport failures only), raise the last error
 ```
 
 `complete` returns the 200 payload as it is, instead of extracting the text. `stream` sends
-the same body with `"stream": true` through `httpx.stream`, yields each `data:` chunk's delta
-content as it arrives, and has no retry loop and no breaker.
+the same body with `"stream": true` through `httpx.stream` and yields each `data:` chunk's
+delta content as it arrives. It has no retry loop, but it does go through the breaker:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant SDK as Bifrost.stream
+    participant BR as Breaker
+    participant GW as Gateway /v1
+
+    App->>SDK: async for delta in stream(prompt)
+    SDK->>BR: check()
+    alt circuit open
+        BR-->>App: CircuitOpen(retry_after) — nothing is sent
+    end
+    SDK->>GW: POST /v1/chat/completions {"stream": true}
+    alt error status
+        GW-->>SDK: 4xx / 5xx
+        SDK->>BR: record_failure(error) — counted for 5xx only
+        SDK-->>App: typed GatewayError / RateLimitedError — not retried
+    else connect error or timeout
+        SDK->>BR: record_failure(Unreachable) — counted
+        SDK-->>App: Unreachable
+    else accepted
+        GW-->>SDK: 200 text/event-stream
+        SDK->>BR: record_success()
+        loop each data: line until [DONE]
+            GW-->>SDK: data: {"choices": [{"delta": {"content": ...}}]}
+            SDK-->>App: delta
+        end
+        opt gateway reports an error inside the stream
+            GW-->>SDK: data: {"error": {...}}
+            SDK-->>App: GatewayError — not a silently short answer
+        end
+        opt connection lost mid-stream
+            SDK->>BR: record_failure(Unreachable) — counted
+            SDK-->>App: Unreachable
+        end
+    end
+```
 
 ## Listing and calling MCP tools
 
@@ -176,7 +218,7 @@ sequenceDiagram
     opt a Code Mode meta-tool is listed
         SDK->>MCP: tools/call listToolFiles
         MCP-->>SDK: servers/<client>.pyi names
-        loop each Code Mode client
+        par up to four at a time, results kept in listed order
             SDK->>MCP: tools/call readToolFile {"fileName": "servers/<client>.pyi"}
             MCP-->>SDK: def tool(param: type, ...) lines
         end
@@ -207,21 +249,98 @@ sequenceDiagram
     end
 ```
 
+## Errors
+
+Every exception is a `BifrostError` and carries `retryable` (whether the same call may succeed
+later); the contracts' `AgentError.of` reads it instead of re-deriving the rule. The typed
+status errors subclass `GatewayError`, so existing `except GatewayError` code still catches
+them; `RateLimitedError` subclasses `RateLimited` and deliberately not `GatewayError`, so code
+that counts `GatewayError` as failure still never counts a 429.
+
+```mermaid
+classDiagram
+    class BifrostError {
+        details: dict
+        retryable: bool = False
+    }
+    class Unreachable {
+        retryable = True
+    }
+    class RateLimited {
+        retry_after: float or None
+        retryable = True
+    }
+    class RateLimitedError {
+        status = 429
+    }
+    class GatewayError {
+        status: int or None
+        retryable = status in RETRYABLE
+    }
+    class CircuitOpen {
+        retry_after: float
+        retryable = True
+    }
+    BifrostError <|-- Unreachable
+    BifrostError <|-- RateLimited
+    RateLimited <|-- RateLimitedError
+    BifrostError <|-- GatewayError
+    BifrostError <|-- CircuitOpen
+    BifrostError <|-- EmptyResponse
+    BifrostError <|-- InvalidJSON
+    GatewayError <|-- BadRequestError : 400
+    GatewayError <|-- AuthenticationError : 401
+    GatewayError <|-- PermissionDeniedError : 403
+    GatewayError <|-- NotFoundError : 404
+    GatewayError <|-- ConflictError : 409
+    GatewayError <|-- UnprocessableError : 422
+    GatewayError <|-- ServerError : 5xx
+```
+
+## Retry policy
+
+Only `chat`, `json` and `complete` retry, on a status in `RETRYABLE` (`408, 409, 425, 429,
+500, 502, 503, 504`) or a transport failure, up to `max_retries` times. The wait before each
+retry:
+
+```mermaid
+flowchart TB
+    failed["attempt failed with a retryable status<br/>or a transport error"] --> last{"retries left?"}
+    last -- no --> give["record_failure(error) once<br/>raise the last error"]
+    last -- yes --> advice{"Retry-After header, or<br/>'retry in Ns' in the body?"}
+    advice -- yes --> given["wait = that delay, as given<br/>(no jitter)"]
+    advice -- no --> jitter["wait = uniform(0, backoff_seconds * 2^attempt)<br/>(full jitter)"]
+    given --> cap["wait = min(wait, MAX_WAIT = 30s)"]
+    jitter --> cap
+    cap --> again["sleep, then the next attempt"]
+```
+
+Full jitter, because the bare exponential is the same number in every process: when the
+gateway comes back, every agent that failed in the same second would retry in the same
+second. The gateway's own delay is not jittered — it says when there will be room.
+
 ## The circuit breaker
 
 Retries handle one bad call; the breaker handles a bad gateway. It counts failed *calls*
-(a call whose retries are all spent counts once) and ignores `RateLimited`.
+(a call whose retries are all spent counts once), and only the failures that say the gateway
+is unwell (`_breaker.counts`): transport failures, 5xx, and a 2xx with an unusable body. No
+4xx counts — not 429 (backpressure), not 400/404/409/422 (a verdict on that request: a few
+over-long prompts must not open the circuit for every agent sharing the client), and not
+401/403 (one mis-keyed caller must not take the gateway away from correctly keyed ones). A
+4xx neither adds to the streak nor resets it. `chat`, `json`, `complete` and `stream` use it;
+tool execution and management calls do not.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Closed
-    Closed --> Closed: success (failures reset to 0)
-    Closed --> Closed: RateLimited (not counted)
+    Closed --> Closed: success, or a stream accepted (failures reset to 0)
+    Closed --> Closed: 4xx incl. 429 (not counted, streak kept)
+    Closed --> Closed: 5xx or transport failure (failures + 1)
     Closed --> Open: failures reach circuit_failure_threshold
-    Open --> Open: call raises CircuitOpen, nothing sent
+    Open --> Open: call or stream raises CircuitOpen, nothing sent
     Open --> Trial: circuit_open_seconds pass
     Trial --> Closed: next call succeeds
-    Trial --> Open: next call fails
+    Trial --> Open: next call fails with 5xx or transport failure
 ```
 
 `circuit_failure_threshold=0` removes the breaker entirely.
@@ -230,8 +349,14 @@ stateDiagram-v2
 
 - **The gateway holds the credentials.** The SDK sends a virtual key, never a provider key,
   and imports no provider SDK; changing provider is changing a model string.
-- **A 429 is not a failure.** `RateLimited` is not a `GatewayError` and never trips the
-  breaker; its delay comes from `Retry-After` or from the body, where Gemini puts it.
+- **A 429 is not a failure.** `RateLimited` (and `RateLimitedError`) is not a `GatewayError`
+  and never trips the breaker; its delay comes from `Retry-After` or from the body, where
+  Gemini puts it.
+- **Only a sick gateway trips the breaker.** 5xx and transport failures count; a 4xx is a
+  verdict on one request (or one key) and counts for nothing, so one caller's bad prompts or
+  bad key cannot fail every other caller in the process.
+- **Typed, not breaking.** Each common status has its own `GatewayError` subclass, and every
+  error says whether it is `retryable`.
 - **Only replayable things are retried.** Completions are; streams (the caller has already
   seen part of the text), tool executions (side effects) and management calls (mostly writes)
   are not.

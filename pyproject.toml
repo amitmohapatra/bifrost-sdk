@@ -28,7 +28,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["live: needs a running gateway; opt in with BIFROST_LIVE_URL"]
+# The live tests register MCP clients and virtual keys on whatever gateway BIFROST_URL names,
+# and that variable is set in shells that never meant to: they run only when asked for, with
+# `-m live` (a later -m replaces this one).
+addopts = ["-m", "not live"]
+markers = ["live: needs a running gateway (BIFROST_URL, or BIFROST_LIVE_URL); run with -m live"]
 
 [tool.ruff.lint.per-file-ignores]
 # PLR0913: the three verbs take many *keyword-only* arguments on purpose — that is the

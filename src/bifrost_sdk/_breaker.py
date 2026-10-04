@@ -11,13 +11,36 @@ Transport, retries and rate-limit parsing moved here for exactly this reason. Th
 left behind on the argument that only the caller knows what a failure costs it, which is true
 of the *thresholds* and not of the mechanism — so the thresholds stay arguments and the
 mechanism stops being copied.
+
+What counts follows from the same argument: a 400 is the gateway working too. Counting
+every error status meant a handful of over-long prompts — each refused in milliseconds with
+a 400 by a perfectly healthy gateway — would open the circuit for every agent sharing the
+client. So only the failures that say the *gateway* is unwell count: transport
+failures (it could not be reached, or timed out) and 5xx (it, or its provider, broke).
+Every 4xx is a verdict on the request, not on the gateway, and that includes 401 and 403:
+a bad or under-privileged key is one caller's misconfiguration, and letting it open the
+circuit would let one mis-keyed agent take the gateway away from the correctly keyed ones.
 """
 
 from __future__ import annotations
 
 import time
 
-from bifrost_sdk._errors import CircuitOpen, RateLimited
+from bifrost_sdk._errors import SERVER_ERROR, CircuitOpen, GatewayError, Unreachable
+
+
+def counts(exc: BaseException | None) -> bool:
+    """Whether ``exc`` says the gateway is unwell, and so counts toward opening the circuit.
+
+    Transport failures and 5xx do; so does a 2xx whose body is unusable (``status`` is
+    ``None``: the gateway answered, wrongly), and a failure recorded without an exception.
+    Rate limits, every other 4xx, and anything that is not a gateway failure do not.
+    """
+    if exc is None or isinstance(exc, Unreachable):
+        return True
+    if isinstance(exc, GatewayError):
+        return exc.status is None or exc.status >= SERVER_ERROR
+    return False
 
 
 class Breaker:
@@ -47,13 +70,14 @@ class Breaker:
         self.consecutive_failures = 0
 
     def record_failure(self, exc: BaseException | None = None) -> None:
-        """Count a failure, unless it is the gateway asking for less traffic.
+        """Count a failure, if it is one that says the gateway is unwell (:func:`counts`).
 
-        ``exc`` is the failure itself rather than a boolean, so the one rule that matters —
-        rate limits do not trip the breaker — is applied here and cannot be got wrong
-        differently in each caller.
+        ``exc`` is the failure itself rather than a boolean, so the rules that matter — rate
+        limits and other 4xx do not trip the breaker — are applied here and cannot be got
+        wrong differently in each caller. A failure that does not count leaves the streak
+        as it was: the gateway answered, but not with the success that would end it.
         """
-        if not self.threshold or isinstance(exc, RateLimited):
+        if not self.threshold or not counts(exc):
             return
         self.consecutive_failures += 1
         if self.consecutive_failures >= self.threshold:
