@@ -21,10 +21,12 @@ from bifrost_sdk import (
     MCPConnection,
     MCPLog,
     Options,
+    RateLimited,
     ToolAnnotations,
     ToolDef,
     Unreachable,
 )
+from bifrost_sdk._mcp import declared_tools
 
 BASE = "http://gateway.test/v1"
 
@@ -618,3 +620,224 @@ async def test_bad_log_queries_are_refused_before_a_request(since, limit, messag
         await bf.mcp_logs(since, limit=limit)
     assert sent == []
     await bf.aclose()
+
+
+# ----------------------------------------------------------------- parsing edge cases
+
+
+@pytest.mark.parametrize(
+    ("allowed", "expected"),
+    [
+        (("*",), ["erp-get_stock", "erp-create_po"]),
+        (("get_stock",), ["erp-get_stock"]),
+        ((), []),
+    ],
+    ids=["all", "one", "none"],
+)
+def test_executable_is_what_tools_to_execute_lets_run(allowed, expected) -> None:
+    """The listing shows every discovered tool; the allow-list decides which may run."""
+    tools = tuple(ToolDef(name=f"erp-{t}", client="erp") for t in ("get_stock", "create_po"))
+    erp = MCPClient(
+        id="id-erp",
+        config=ERP.model_copy(update={"tools_to_execute": allowed}),
+        state="healthy",
+        tools=tools,
+    )
+    assert names(list(erp.executable)) == expected
+
+
+async def test_a_plain_connection_string_and_a_bare_entry_parse() -> None:
+    """``connection_string`` may be a plain string or absent; ``state`` may be missing."""
+    plain = entry("erp", [], disabled=True)
+    plain["config"]["connection_string"] = "https://erp.test/mcp"
+    plain.pop("state")
+    bare = entry("crm", [])
+    bare["config"].pop("connection_string")
+    _, handler = listing(plain, bare)
+    bf = client(handler)
+    erp, crm = await bf.mcp.clients()
+    assert erp.config.connection == MCPConnection(type="http", url="https://erp.test/mcp")
+    assert (erp.state, erp.disabled) == ("", True)
+    assert crm.config.connection == MCPConnection(type="http", url=None)
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    "mcp",
+    [
+        httpx.Response(401, text="Unauthorized"),
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"tools": "none"}}),
+        httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32601}}),
+        httpx.Response(200, json=["not", "an", "object"]),
+    ],
+    ids=["refused", "tools-not-a-list", "rpc-error", "not-an-object"],
+)
+async def test_clients_are_listed_without_annotations_when_the_mcp_listing_fails(mcp) -> None:
+    """Annotations are an enrichment: the admin registry is still the answer without them."""
+    _, handler = listing(entry("erp", ["get_stock"]), mcp=mcp)
+    bf = client(handler)
+    [erp] = await bf.mcp.clients()
+    assert [(t.name, t.annotations) for t in erp.tools] == [("erp-get_stock", None)]
+    await bf.aclose()
+
+
+async def test_logged_arguments_that_are_already_structured_are_kept() -> None:
+    logged = {**LOGGED, "arguments": {"repoName": "x"}, "server_label": None}
+    bf = client(lambda r: httpx.Response(200, json={"logs": [logged]}))
+    [log] = await bf.mcp_logs(SINCE)
+    assert (log.arguments, log.client, log.latency_ms) == ({"repoName": "x"}, "", 353)
+    await bf.aclose()
+
+
+async def test_a_log_page_without_an_envelope_or_a_body_is_read_as_is() -> None:
+    answers = [httpx.Response(200, json=[LOGGED]), httpx.Response(200)]
+    bf = client(lambda r: answers.pop(0))
+    assert [log.id for log in await bf.mcp_logs(SINCE)] == ["log-1"]
+    assert await bf.mcp_logs(SINCE) == []
+    await bf.aclose()
+
+
+async def test_listing_entries_that_are_not_tools_are_skipped() -> None:
+    """Junk entries, nameless entries, a non-object schema and non-object hints are dropped
+    one field at a time rather than failing the whole listing."""
+    tools = [
+        {"name": "erp-get_stock", "inputSchema": "not a schema", "annotations": ["x"]},
+        "junk",
+        {"description": "nameless"},
+        {"name": "standalone", "description": None},
+    ]
+    _, handler = gateway_mcp(tools)
+    bf = client(handler)
+    stock, standalone = await bf.tools()
+    assert (stock.parameters, stock.annotations) == ({}, None)
+    assert (standalone.client, standalone.description) == ("standalone", "")
+    await bf.aclose()
+
+
+async def test_a_listing_with_no_tools_key_is_empty() -> None:
+    rpc = {"jsonrpc": "2.0", "id": 1, "result": {}}
+    bf = client(lambda r: httpx.Response(200, json=rpc))
+    assert await bf.tools() == []
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    ("answer", "error", "message"),
+    [
+        (httpx.ConnectError("refused"), Unreachable, "ConnectError"),
+        (httpx.Response(200, text="<html>"), GatewayError, "non-JSON"),
+        (httpx.Response(200, json={"jsonrpc": "2.0", "result": []}), GatewayError, "failed"),
+        (httpx.Response(200, json=[]), GatewayError, "failed: None"),
+        (httpx.Response(429, text="slow down"), RateLimited, "rate limited"),
+    ],
+    ids=["unreachable", "non-json", "result-not-an-object", "not-an-object", "rate-limited"],
+)
+async def test_each_way_the_mcp_endpoint_can_fail_has_its_error(answer, error, message) -> None:
+    def handler(request):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    bf = client(handler)
+    with pytest.raises(error, match=message):
+        await bf.tools()
+    await bf.aclose()
+
+
+async def test_a_failing_meta_tool_is_an_error_not_an_empty_code_mode_client() -> None:
+    def handler(request):
+        if jsonlib.loads(request.content)["method"] == "tools/list":
+            return rpc_tools([{"name": "listToolFiles"}])
+        result = {"isError": True, "content": [{"type": "text", "text": "denied"}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    bf = client(handler)
+    with pytest.raises(GatewayError, match="listToolFiles failed") as caught:
+        await bf.tools()
+    assert "denied" in caught.value.details["body"]
+    await bf.aclose()
+
+
+async def test_meta_tool_text_ignores_parts_that_are_not_text() -> None:
+    """``readToolFile`` text may arrive in several parts, some of them not text at all."""
+
+    def handler(request):
+        body = jsonlib.loads(request.content)
+        if body["method"] == "tools/list":
+            return rpc_tools([{"name": "readToolFile"}])
+        if body["params"]["name"] == "listToolFiles":
+            content = [{"type": "text", "text": "servers/\n  docs.pyi\n  docs.pyi"}]
+        else:
+            content = [
+                {"type": "text", "text": "def a() -> dict:  # A."},
+                {"type": "image", "text": None},
+                "junk",
+                {"type": "text", "text": "def b(x: int) -> dict:"},
+            ]
+        result = {"content": content}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    bf = client(handler)
+    a, b = await bf.tools()
+    assert (a.name, a.description, a.parameters) == (
+        "docs-a",
+        "A.",
+        {"type": "object", "properties": {}},
+    )
+    assert (b.name, b.description) == ("docs-b", "")
+    assert b.parameters == {
+        "type": "object",
+        "properties": {"x": {"type": "integer"}},
+        "required": ["x"],
+    }
+    await bf.aclose()
+
+
+def test_a_declaration_is_split_on_top_level_commas_only() -> None:
+    """Nested brackets do not split a parameter; ``*`` / ``*args`` and a trailing comma do not
+    become parameters of their own."""
+    [tool] = declared_tools(
+        "erp",
+        "def f(m: dict[str, list[int]], t: tuple[int, int] = (1, 2), *, flag: bool, "
+        "*args: str,) -> dict:  # F.",
+    )
+    assert tool.parameters == {
+        "type": "object",
+        "properties": {
+            "m": {"type": "object"},
+            "t": {},
+            "flag": {"type": "boolean"},
+            "args": {"type": "string"},
+        },
+        "required": ["m", "flag", "args"],
+    }
+
+
+async def test_execute_tool_passes_a_deadline_for_this_call_only() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request):
+        seen["timeout"] = request.extensions.get("timeout")
+        return httpx.Response(200, json={"role": "tool", "content": "ok"})
+
+    bf = client(handler)
+    await bf.execute_tool({"function": {"name": "erp-answer"}}, timeout=1.5)
+    assert seen["timeout"] == {"connect": 1.5, "pool": 1.5, "read": 1.5, "write": 1.5}
+    await bf.aclose()
+
+
+async def test_execute_tool_is_not_counted_by_the_breaker() -> None:
+    """A tool's failure is the tool's, not the gateway's: it must not stop completions."""
+    bf = client(lambda r: httpx.Response(500, text="tool crashed"))
+    for _ in range(6):
+        with pytest.raises(GatewayError):
+            await bf.execute_tool({"function": {"name": "erp-answer"}})
+    assert bf._breaker.consecutive_failures == 0
+    await bf.aclose()
+
+
+def test_tool_annotations_parse_from_either_spelling() -> None:
+    wire = ToolAnnotations.model_validate({"readOnlyHint": True, "openWorldHint": False})
+    python = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+    assert wire == python
+    assert (python.destructive_hint, python.idempotent_hint) == (None, None)
