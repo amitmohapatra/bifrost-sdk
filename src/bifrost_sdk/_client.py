@@ -40,6 +40,7 @@ from bifrost_sdk._errors import (
 from bifrost_sdk._mcp import (
     CODE_MODE_META_TOOLS,
     MCP,
+    MCP_ENDPOINT,
     MCPLog,
     ToolDef,
     declared_tools,
@@ -53,8 +54,6 @@ from bifrost_sdk.headers import Options
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
 
-#: The gateway's own MCP server (a sibling of ``/v1``), the listing a virtual key may ask for.
-MCP_ENDPOINT = "/mcp"
 #: The gateway's maximum page size for ``GET /api/mcp-logs``.
 MAX_LOG_PAGE = 1000
 

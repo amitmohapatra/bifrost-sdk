@@ -744,7 +744,7 @@ async def test_a_spent_retry_budget_counts_once_not_once_per_attempt() -> None:
             await bf.chat("hi")
     assert calls["n"] == 6, "two calls, three attempts each"
     assert bf._breaker.consecutive_failures == 2
-    assert not bf._breaker.is_open
+    bf._breaker.check()  # still closed: raises CircuitOpen otherwise
 
 
 async def test_threshold_zero_disables_the_breaker() -> None:

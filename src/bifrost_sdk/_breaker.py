@@ -31,10 +31,6 @@ class Breaker:
         self.consecutive_failures = 0
         self.open_until = 0.0
 
-    @property
-    def is_open(self) -> bool:
-        return bool(self.threshold) and time.monotonic() < self.open_until
-
     def check(self) -> None:
         """Raise if the circuit is open, carrying how long is left on it."""
         if not self.threshold:
