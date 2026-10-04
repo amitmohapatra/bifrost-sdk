@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from bifrost_sdk import GatewayError, RateLimited, Unreachable
+from bifrost_sdk import GatewayError, PermissionDeniedError, RateLimited, Unreachable
 from bifrost_sdk.admin import Admin
 
 
@@ -132,9 +132,11 @@ async def test_an_error_status_keeps_its_code() -> None:
         return httpx.Response(403, text="forbidden")
 
     admin = client(handler)
-    with pytest.raises(GatewayError) as caught:
+    with pytest.raises(PermissionDeniedError) as caught:
         await admin.vk.list()
+    assert isinstance(caught.value, GatewayError)
     assert caught.value.details["status"] == 403
+    assert (caught.value.status, caught.value.retryable) == (403, False)
     await admin.aclose()
 
 

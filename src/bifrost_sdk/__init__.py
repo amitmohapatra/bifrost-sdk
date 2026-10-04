@@ -18,12 +18,20 @@ administration lives in :mod:`bifrost_sdk.admin`.
 
 from bifrost_sdk._client import Bifrost, Messages
 from bifrost_sdk._errors import (
+    AuthenticationError,
+    BadRequestError,
     BifrostError,
     CircuitOpen,
+    ConflictError,
     EmptyResponse,
     GatewayError,
     InvalidJSON,
+    NotFoundError,
+    PermissionDeniedError,
     RateLimited,
+    RateLimitedError,
+    ServerError,
+    UnprocessableError,
     Unreachable,
 )
 from bifrost_sdk._mcp import (
@@ -39,9 +47,12 @@ from bifrost_sdk.headers import Options
 
 __all__ = [
     "RETRYABLE",
+    "AuthenticationError",
+    "BadRequestError",
     "Bifrost",
     "BifrostError",
     "CircuitOpen",
+    "ConflictError",
     "EmptyResponse",
     "GatewayError",
     "InvalidJSON",
@@ -50,9 +61,14 @@ __all__ = [
     "MCPConnection",
     "MCPLog",
     "Messages",
+    "NotFoundError",
     "Options",
+    "PermissionDeniedError",
     "RateLimited",
+    "RateLimitedError",
+    "ServerError",
     "ToolAnnotations",
     "ToolDef",
+    "UnprocessableError",
     "Unreachable",
 ]

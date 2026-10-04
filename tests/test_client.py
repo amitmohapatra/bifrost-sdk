@@ -7,22 +7,33 @@ codebase — twice, in two separate implementations that made the same mistakes 
 from __future__ import annotations
 
 import json as jsonlib
+import random
 
 import httpx
 import pytest
 import respx
 
+import bifrost_sdk
 from bifrost_sdk import (
+    AuthenticationError,
+    BadRequestError,
     Bifrost,
+    BifrostError,
     CircuitOpen,
+    ConflictError,
     EmptyResponse,
     GatewayError,
     InvalidJSON,
+    NotFoundError,
+    PermissionDeniedError,
     RateLimited,
+    RateLimitedError,
+    ServerError,
+    UnprocessableError,
     Unreachable,
 )
 from bifrost_sdk import _breaker as breaker_module
-from bifrost_sdk._retry import retry_after
+from bifrost_sdk._retry import MAX_WAIT, backoff, retry_after
 from bifrost_sdk.headers import Options
 
 BASE = "http://gateway.test/v1"
@@ -947,21 +958,58 @@ def _then(*responses: httpx.Response):
     return handler, calls
 
 
-async def test_without_advice_the_wait_doubles_each_attempt(
+class _Draw:
+    """A jitter source that always draws ``value``: the top of the window at 1.0."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+async def test_without_advice_the_window_doubles_each_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     waits = _sleeps(monkeypatch)
     handler, calls = _then(httpx.Response(502), httpx.Response(504), reply("ok"))
     bf = client(handler, max_retries=2, backoff_seconds=0.5)
+    bf._rng = _Draw(1.0)
     assert await bf.chat("hi") == "ok"
     assert waits == [0.5, 1.0]
     assert calls["n"] == 3
     await bf.aclose()
 
 
-async def test_a_rate_limits_own_delay_replaces_the_backoff_but_never_exceeds_a_minute(
+async def test_the_backoff_is_a_uniform_draw_across_the_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Full jitter: processes that failed in the same second must not all retry in the same
+    second, or a gateway restart is followed by a stampede."""
+    waits = _sleeps(monkeypatch)
+    handler, _ = _then(*(httpx.Response(503) for _ in range(4)), reply("ok"))
+    bf = client(handler, max_retries=4, backoff_seconds=1.0)
+    bf._rng = random.Random(7)
+    assert await bf.chat("hi") == "ok"
+    expected = random.Random(7)
+    assert waits == [expected.random() * 2**n for n in range(4)]
+    assert all(0 <= wait < 2**n for n, wait in enumerate(waits))
+    assert len(set(waits)) == 4
+    await bf.aclose()
+
+
+def test_backoff_windows_are_capped_and_drawn_from_the_shared_source_by_default() -> None:
+    assert backoff(3, 0.5, _Draw(0.5)) == 2.0
+    assert backoff(20, 0.5, _Draw(1.0)) == MAX_WAIT == 30.0
+    assert backoff(0, 0.0) == 0.0
+    assert 0 <= backoff(2, 1.0) < 4.0
+
+
+async def test_a_rate_limits_own_delay_replaces_the_backoff_up_to_thirty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway's delay is honoured as given, unjittered — it knows when it has room —
+    but no longer than MAX_WAIT, whatever it asks for."""
     waits = _sleeps(monkeypatch)
     handler, _ = _then(
         httpx.Response(429, headers={"Retry-After": "300"}),
@@ -969,8 +1017,9 @@ async def test_a_rate_limits_own_delay_replaces_the_backoff_but_never_exceeds_a_
         reply("ok"),
     )
     bf = client(handler, max_retries=2, backoff_seconds=0.5)
+    bf._rng = _Draw(0.0)
     assert await bf.chat("hi") == "ok"
-    assert waits == [60.0, 2.5]
+    assert waits == [30.0, 2.5]
     await bf.aclose()
 
 
@@ -978,6 +1027,7 @@ async def test_no_wait_follows_the_last_attempt(monkeypatch: pytest.MonkeyPatch)
     waits = _sleeps(monkeypatch)
     handler, calls = _then(httpx.Response(500), httpx.Response(500))
     bf = client(handler, max_retries=1, backoff_seconds=0.25)
+    bf._rng = _Draw(1.0)
     with pytest.raises(GatewayError):
         await bf.chat("hi")
     assert (calls["n"], waits) == (2, [0.25])
@@ -1170,3 +1220,278 @@ def test_a_retry_after_date_without_a_zone_is_read_as_utc() -> None:
 def test_an_unreadable_header_falls_back_to_the_body() -> None:
     assert retry_after({"retry-after": "soon"}, "Please retry in 4s.") == 4.0
     assert retry_after({"retry-after": "-5"}) == 0.0, "a negative delay is no delay"
+
+
+# ----------------------------------------------------------------- typed errors
+
+
+@pytest.mark.parametrize(
+    ("status", "kind", "retryable"),
+    [
+        (400, BadRequestError, False),
+        (401, AuthenticationError, False),
+        (403, PermissionDeniedError, False),
+        (404, NotFoundError, False),
+        (409, ConflictError, True),
+        (422, UnprocessableError, False),
+        (500, ServerError, True),
+        (502, ServerError, True),
+        (503, ServerError, True),
+        (504, ServerError, True),
+        (501, ServerError, False),
+        (408, GatewayError, True),
+        (413, GatewayError, False),
+    ],
+)
+async def test_each_status_has_its_type_and_says_whether_a_retry_could_help(
+    status: int, kind: type[GatewayError], retryable: bool
+) -> None:
+    """Typed, but still ``GatewayError``: code that caught the one class keeps working."""
+    bf = client(lambda r: httpx.Response(status, text="no"), max_retries=0)
+    with pytest.raises(GatewayError) as caught:
+        await bf.chat("hi")
+    assert type(caught.value) is kind
+    assert (caught.value.status, caught.value.retryable) == (status, retryable)
+    assert caught.value.details == {"status": status, "body": "no"}
+    await bf.aclose()
+
+
+async def test_a_429_is_a_rate_limited_error_and_still_not_a_gateway_error() -> None:
+    bf = client(lambda r: httpx.Response(429, headers={"Retry-After": "4"}), max_retries=0)
+    with pytest.raises(RateLimitedError) as caught:
+        await bf.chat("hi")
+    assert isinstance(caught.value, RateLimited)
+    assert not isinstance(caught.value, GatewayError)
+    assert (caught.value.status, caught.value.retry_after, caught.value.retryable) == (
+        429,
+        4.0,
+        True,
+    )
+    await bf.aclose()
+
+
+def test_every_error_says_whether_a_retry_could_help() -> None:
+    """``AgentError.of`` in the contracts reads ``retryable`` off the exception itself."""
+    assert Unreachable("x").retryable
+    assert RateLimited("x").retryable
+    assert CircuitOpen("x").retryable
+    assert not EmptyResponse("x").retryable
+    assert not InvalidJSON("x").retryable
+    assert not BifrostError("x").retryable
+    unusable = GatewayError("gateway returned a non-JSON body")
+    assert (unusable.status, unusable.retryable) == (None, False)
+
+
+def test_the_typed_errors_are_public() -> None:
+    names = {
+        "AuthenticationError",
+        "BadRequestError",
+        "ConflictError",
+        "NotFoundError",
+        "PermissionDeniedError",
+        "RateLimitedError",
+        "ServerError",
+        "UnprocessableError",
+    }
+    assert names <= set(bifrost_sdk.__all__)
+    assert all(hasattr(bifrost_sdk, name) for name in names)
+
+
+# ----------------------------------------------------------------- what the breaker counts
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+async def test_a_refused_request_never_opens_the_breaker(status: int) -> None:
+    """A healthy gateway refusing a bad prompt in milliseconds says nothing about the gateway.
+    Counting it let a few over-long prompts fail every other agent sharing the client. A 409
+    is retried first, and does not count once the retries are spent either."""
+    handler, calls = _boom(status)
+    bf = client(handler, max_retries=1, backoff_seconds=0.0, circuit_failure_threshold=2)
+    for _ in range(5):
+        with pytest.raises(GatewayError):
+            await bf.chat("hi")
+    assert calls["n"] == 5 * (2 if status == 409 else 1)
+    assert bf._breaker.consecutive_failures == 0
+    bf._breaker.check()
+    await bf.aclose()
+
+
+async def test_a_refusal_neither_counts_nor_resets_a_streak_of_server_errors() -> None:
+    handler, _ = _then(httpx.Response(500), httpx.Response(400), httpx.Response(500))
+    bf = client(handler, max_retries=0, circuit_failure_threshold=2)
+    for _ in range(3):
+        with pytest.raises(GatewayError):
+            await bf.chat("hi")
+    with pytest.raises(CircuitOpen):
+        await bf.chat("hi")
+    await bf.aclose()
+
+
+async def test_a_server_error_no_retry_can_fix_still_counts() -> None:
+    handler, calls = _boom(501)
+    bf = client(handler, max_retries=3, circuit_failure_threshold=1)
+    with pytest.raises(ServerError):
+        await bf.chat("hi")
+    assert calls["n"] == 1, "501 is not in RETRYABLE"
+    with pytest.raises(CircuitOpen):
+        await bf.chat("hi")
+    await bf.aclose()
+
+
+def test_the_breaker_counts_only_what_says_the_gateway_is_unwell() -> None:
+    assert breaker_module.counts(None)
+    assert breaker_module.counts(Unreachable("x"))
+    assert breaker_module.counts(ServerError("x", status=503))
+    assert breaker_module.counts(GatewayError("unusable body"))
+    assert not breaker_module.counts(RateLimitedError("x", status=429))
+    assert not breaker_module.counts(AuthenticationError("x", status=401))
+    assert not breaker_module.counts(EmptyResponse("x"))
+
+
+# ----------------------------------------------------------------- the stream and the breaker
+
+
+async def test_an_open_circuit_fails_a_stream_before_anything_is_sent() -> None:
+    handler, calls = _boom(503)
+    bf = client(handler, max_retries=0, circuit_failure_threshold=1)
+    with pytest.raises(ServerError):
+        await bf.chat("hi")
+    with pytest.raises(CircuitOpen):
+        [d async for d in bf.stream("hi")]
+    assert calls["n"] == 1
+    await bf.aclose()
+
+
+async def test_a_stream_that_fails_to_start_counts_like_a_completion() -> None:
+    handler, _ = _boom(503)
+    bf = client(handler, circuit_failure_threshold=2)
+    for _ in range(2):
+        with pytest.raises(ServerError):
+            [d async for d in bf.stream("hi")]
+    with pytest.raises(CircuitOpen):
+        await bf.chat("hi")
+    await bf.aclose()
+
+
+async def test_a_refused_stream_does_not_count() -> None:
+    handler, _ = _boom(400)
+    bf = client(handler, circuit_failure_threshold=1)
+    with pytest.raises(BadRequestError):
+        [d async for d in bf.stream("hi")]
+    assert bf._breaker.consecutive_failures == 0
+    await bf.aclose()
+
+
+async def test_an_accepted_stream_ends_a_failure_streak() -> None:
+    handler, _ = _then(
+        httpx.Response(500),
+        httpx.Response(200, text='data: {"choices":[{"delta":{"content":"ok"}}]}'),
+    )
+    bf = client(handler, max_retries=0, circuit_failure_threshold=3)
+    with pytest.raises(ServerError):
+        await bf.chat("hi")
+    assert bf._breaker.consecutive_failures == 1
+    assert [d async for d in bf.stream("hi")] == ["ok"]
+    assert bf._breaker.consecutive_failures == 0
+    await bf.aclose()
+
+
+async def test_a_stream_that_cannot_connect_counts() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    bf = client(handler, circuit_failure_threshold=1)
+    with pytest.raises(Unreachable):
+        [d async for d in bf.stream("hi")]
+    with pytest.raises(CircuitOpen):
+        [d async for d in bf.stream("hi")]
+    await bf.aclose()
+
+
+class _DropsMidStream(httpx.AsyncByteStream):
+    """One chunk of text, then the connection goes."""
+
+    async def __aiter__(self):
+        yield b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        raise httpx.ReadError("connection reset")
+
+
+async def test_a_connection_lost_mid_stream_is_unreachable_and_counts() -> None:
+    bf = client(
+        lambda r: httpx.Response(200, stream=_DropsMidStream()), circuit_failure_threshold=1
+    )
+    seen: list[str] = []
+    with pytest.raises(Unreachable, match="ReadError"):
+        async for delta in bf.stream("hi"):
+            seen.append(delta)
+    assert seen == ["Hel"]
+    with pytest.raises(CircuitOpen):
+        await bf.chat("hi")
+    await bf.aclose()
+
+
+async def test_an_error_reported_inside_a_stream_is_raised_not_a_short_answer() -> None:
+    body = (
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        'data: {"error":{"message":"upstream provider disconnected","type":"server_error"}}\n\n'
+    )
+    bf = client(lambda r: httpx.Response(200, text=body))
+    seen: list[str] = []
+    with pytest.raises(GatewayError, match="mid-stream") as caught:
+        async for delta in bf.stream("hi"):
+            seen.append(delta)
+    assert seen == ["Hel"]
+    assert "upstream provider disconnected" in caught.value.details["body"]
+    await bf.aclose()
+
+
+async def test_a_stream_ignores_chunks_of_the_wrong_shape() -> None:
+    body = (
+        "data: 42\n\n"
+        'data: {"choices":["junk"]}\n\n'
+        'data: {"choices":[{"delta":"junk"}]}\n\n'
+        'data: {"choices":{"0":{}}}\n\n'
+        'data: {"error":null,"choices":[{"delta":{"content":"ok"}}]}\n\n'
+    )
+    bf = client(lambda r: httpx.Response(200, text=body))
+    assert [d async for d in bf.stream("hi")] == ["ok"]
+    await bf.aclose()
+
+
+# ----------------------------------------------------------------- the rest of the hardening
+
+
+def test_a_negative_retry_budget_is_refused() -> None:
+    with pytest.raises(ValueError, match="max_retries"):
+        Bifrost(BASE, max_retries=-1)
+
+
+async def test_a_200_whose_json_is_not_an_object_is_a_counted_gateway_fault() -> None:
+    bf = client(lambda r: httpx.Response(200, json=[1, 2]), max_retries=2)
+    with pytest.raises(GatewayError, match="not an object") as caught:
+        await bf.chat("hi")
+    assert caught.value.status is None
+    assert bf._breaker.consecutive_failures == 1
+    await bf.aclose()
+
+
+async def test_both_clients_pool_and_time_out_explicitly(monkeypatch: pytest.MonkeyPatch) -> None:
+    built: list[dict] = []
+
+    class Spy(httpx.AsyncClient):
+        def __init__(self, **kwargs) -> None:
+            built.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Spy)
+    async with Bifrost(BASE, model="m", timeout=12.0):
+        pass
+    assert len(built) == 2
+    for kwargs in built:
+        pool = kwargs["limits"]
+        assert (pool.max_connections, pool.max_keepalive_connections, pool.keepalive_expiry) == (
+            100,
+            20,
+            30.0,
+        )
+        assert kwargs["timeout"] == httpx.Timeout(connect=5.0, read=12.0, write=12.0, pool=12.0)

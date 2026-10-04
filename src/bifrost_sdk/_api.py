@@ -16,6 +16,32 @@ from bifrost_sdk._errors import ERROR_STATUS, GatewayError, from_response, unrea
 
 #: Connect timeout ceiling: a gateway that does not accept a connection in this long is down.
 CONNECT_TIMEOUT = 5.0
+#: Connection pool bounds, explicit rather than httpx's defaults, so the numbers a process
+#: runs with are written down somewhere. One client is shared by every agent in a process:
+#: the cap bounds what that process can open against the gateway, and a request beyond it
+#: waits for a free connection (up to the pool timeout) instead of opening another.
+MAX_CONNECTIONS = 100
+#: Idle connections kept for reuse. Enough for a steady stream of calls not to reconnect.
+MAX_KEEPALIVE_CONNECTIONS = 20
+#: How long an idle connection is kept. httpx's default of five seconds is often shorter than
+#: the gap between an agent's turns, which then pay a fresh TCP (and TLS) handshake each.
+KEEPALIVE_EXPIRY = 30.0
+
+
+def limits() -> httpx.Limits:
+    """The connection pool every client this package builds uses."""
+    return httpx.Limits(
+        max_connections=MAX_CONNECTIONS,
+        max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+        keepalive_expiry=KEEPALIVE_EXPIRY,
+    )
+
+
+def timeouts(timeout: float) -> httpx.Timeout:
+    """``timeout`` for reading, writing and waiting on the pool; connecting is capped lower."""
+    return httpx.Timeout(
+        connect=min(CONNECT_TIMEOUT, timeout), read=timeout, write=timeout, pool=timeout
+    )
 
 
 def origin(base_url: str) -> str:
@@ -32,7 +58,8 @@ def management_client(base_url: str, token: str | None, timeout: float) -> httpx
     return httpx.AsyncClient(
         base_url=origin(base_url),
         headers=headers,
-        timeout=httpx.Timeout(timeout, connect=min(CONNECT_TIMEOUT, timeout)),
+        timeout=timeouts(timeout),
+        limits=limits(),
     )
 
 

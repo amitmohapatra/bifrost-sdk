@@ -48,14 +48,19 @@ environment variables in this repository are the opt-in live tests', see [Tests]
 | `base_url` | required | The gateway's inference endpoint, e.g. `http://gateway:8080/v1`. `/mcp` and `/api/*` are derived from its origin. |
 | `model` | `None` | Default model, as the gateway names it (`provider/model`). Every verb takes `model=` to override it; a call with neither raises `ValueError`. |
 | `api_key` | `None` | The gateway **virtual key** (see below). Never a provider key. |
-| `timeout` | `60.0` | Seconds per request. The connect timeout is `min(5.0, timeout)`. |
+| `timeout` | `60.0` | Seconds per request (read, write, and waiting for a pooled connection). The connect timeout is `min(5.0, timeout)`. |
 | `max_retries` | `2` | Retries after the first attempt, for `chat`, `json` and `complete`. |
-| `backoff_seconds` | `0.5` | Base of the exponential backoff (`0.5`, `1.0`, `2.0`, …) when a failure carries no delay of its own. |
+| `backoff_seconds` | `0.5` | Base of the jittered exponential backoff when a failure carries no delay of its own: the wait before retry *n* is drawn uniformly from `[0, backoff_seconds * 2**n)` (windows `0.5`, `1.0`, `2.0`, …, capped at 30 s). |
 | `max_tokens` | `2048` | Output budget `chat`, `json` and `stream` send when the call does not pass one. |
-| `circuit_failure_threshold` | `5` | Consecutive failed calls that open the circuit breaker; `0` disables it. |
+| `circuit_failure_threshold` | `5` | Consecutive failed calls (transport failures and 5xx; never a 4xx or 429) that open the circuit breaker; `0` disables it. |
 | `circuit_open_seconds` | `30.0` | How long an open circuit fails calls without sending them. |
 | `admin_token` | `None` | Bearer token for `/api/*` (MCP client registry, MCP logs); defaults to `api_key`. |
 | `client` / `admin_client` | `None` | Your own `httpx.AsyncClient` for `/v1` + `/mcp` / for `/api/*` (tests, proxies, custom transports). One you pass is not closed by `aclose()`. |
+
+The clients `Bifrost` and `Admin` build for themselves pool connections explicitly: at most
+100 open (`MAX_CONNECTIONS`), 20 kept idle for reuse, each for 30 seconds
+(`bifrost_sdk._api`). A request beyond the cap waits for a free connection, up to `timeout`.
+Pass your own `client=` for other numbers.
 
 ### The virtual key
 
@@ -100,7 +105,7 @@ process that serves several callers through one client.
 | --- | --- | --- |
 | `chat` | `chat(prompt, *, model=None, system=None, max_tokens=None, temperature=0.0, tools=None, options=None, **extra) -> str` | you want the answer |
 | `json` | `json(prompt, *, schema=None, model=None, system=None, max_tokens=None, options=None, **extra) -> dict` | you want the answer parsed, and checked if the provider ignores `response_format` |
-| `stream` | `stream(prompt, *, model=None, system=None, max_tokens=None, temperature=0.0, tools=None, options=None, **extra) -> AsyncIterator[str]` | time-to-first-token matters. Not retried: a partly consumed stream cannot be replayed without showing duplicate text |
+| `stream` | `stream(prompt, *, model=None, system=None, max_tokens=None, temperature=0.0, tools=None, options=None, **extra) -> AsyncIterator[str]` | time-to-first-token matters. Not retried: a partly consumed stream cannot be replayed without showing duplicate text. Uses the circuit breaker like the other verbs; an error the gateway sends inside the stream raises `GatewayError` |
 | `complete` | `complete(prompt, *, model=None, system=None, max_tokens=None, temperature=None, tools=None, timeout=None, options=None, **extra) -> dict` | you need the whole response — usage, tool calls, `finish_reason` — because you are building a framework on the gateway rather than calling one |
 
 - `prompt` is a `Messages`: a string (one user turn) or a list of `{"role", "content"}`
@@ -191,7 +196,10 @@ turn = await bf.execute_tool(tool_call, options=Options(mcp_clients=["erp"]))
   The gateway publishes no JSON schema and no annotations for them: `parameters` is derived
   from the signature (`str`/`int`/`float`/`bool`/`list`/`dict`; any other type admits any
   value; a parameter with a default is optional), `annotations` is `None`, and the
-  description is the declaration's comment, which the gateway may truncate.
+  description is the declaration's comment, which the gateway may truncate. The
+  `readToolFile` calls run four at a time; the tools come back in `listToolFiles` order
+  whatever order the reads finish in, and if any read fails, the listing raises the failure
+  of the first-listed client.
 - `bf.mcp.clients()` is the admin registry (`GET /api/mcp/clients`, every page, every
   discovered tool, annotations joined from `/mcp` when that listing answers); with admin auth
   on it needs `admin_token`. `MCPClient` carries `id`, `config` (`MCPClientConfig`), `state`,
@@ -300,20 +308,37 @@ empty body (`204`) returns `None`; a `200` that is not JSON (the gateway's UI an
 ## Errors
 
 ```
-BifrostError        .details: whatever the gateway said (status, body excerpt, …)
-├── Unreachable     the gateway could not be contacted (connect error, timeout)
-├── RateLimited     429; carries .retry_after (seconds, or None)
-├── GatewayError    the gateway answered with an error status (.details["status"], ["body"])
-├── CircuitOpen     recent calls failed; this one was not sent (.retry_after)
-├── EmptyResponse   200 OK with no text (see below)
-└── InvalidJSON     json() could not parse the reply
+BifrostError                .details: whatever the gateway said (status, body excerpt, …)
+├── Unreachable             the gateway could not be contacted (connect error, timeout)
+├── RateLimited             a 429; carries .retry_after (seconds, or None)
+│   └── RateLimitedError    what this client raises for a 429 (.status == 429)
+├── GatewayError            an error status, or a body this client cannot use (.status, or None)
+│   ├── BadRequestError         400  (e.g. the prompt is over the context length)
+│   ├── AuthenticationError     401
+│   ├── PermissionDeniedError   403
+│   ├── NotFoundError           404
+│   ├── ConflictError           409
+│   ├── UnprocessableError      422
+│   └── ServerError             5xx
+├── CircuitOpen             recent calls failed; this one was not sent (.retry_after)
+├── EmptyResponse           200 OK with no text (see below)
+└── InvalidJSON             json() could not parse the reply
 ```
+
+Any other error status (`408`, `413`, …) is a plain `GatewayError`. The typed classes are
+subclasses, so `except GatewayError` still catches every one of them.
+
+Every error carries `retryable`: whether the *same* call may succeed if made again later.
+It is `True` for `Unreachable`, `RateLimited`, `CircuitOpen`, and for a `GatewayError` whose
+status is in `RETRYABLE` (`408, 409, 425, 500, 502, 503, 504`); `False` for everything else —
+including a `501`, a `GatewayError` without a status, `EmptyResponse` and `InvalidJSON`.
+Callers above this client read it rather than re-deriving the rule.
 
 | Raised by | `Unreachable` | `RateLimited` | `GatewayError` | `CircuitOpen` | `EmptyResponse` | `InvalidJSON` |
 | --- | --- | --- | --- | --- | --- | --- |
 | `chat`, `complete`* | after retries | after retries | yes | yes | `chat` only | |
 | `json` | after retries | after retries | yes | yes | yes | yes |
-| `stream` | yes | yes | yes | | | |
+| `stream` | yes | yes | yes | yes | | |
 | `tools`, `execute_tool`, `mcp_logs`, `bf.mcp.*`, `Admin.*` | yes | yes | yes | | | |
 | `ping` | never raises | | | | | |
 
@@ -322,7 +347,14 @@ Invalid arguments (no model, a naive `since`, a tool call without a name, an unr
 MCP connection) raise `ValueError` before any request is sent.
 
 ```python
-from bifrost_sdk import BifrostError, CircuitOpen, EmptyResponse, GatewayError, RateLimited
+from bifrost_sdk import (
+    BadRequestError,
+    BifrostError,
+    CircuitOpen,
+    EmptyResponse,
+    GatewayError,
+    RateLimited,
+)
 
 try:
     text = await bf.chat(prompt)
@@ -332,16 +364,19 @@ except CircuitOpen as exc:  # nothing was sent; the gateway was failing moments 
     ...
 except EmptyResponse:  # a reasoning model spent the budget: raise max_tokens
     ...
-except GatewayError as exc:  # exc.details["status"], exc.details["body"]
+except BadRequestError:  # this request will never work as sent: change it
+    ...
+except GatewayError as exc:  # exc.status, exc.retryable, exc.details["body"]
     ...
 except BifrostError:  # Unreachable, InvalidJSON
     ...
 ```
 
-`RateLimited` is deliberately **not** a `GatewayError`. A 429 means the gateway is healthy and
-saying so; the circuit breaker does not count it, or "slow down" becomes "stop". Measured on a
-real run: 17 rate limits opened a breaker and the next 62 calls failed instantly without a
-request ever being sent.
+`RateLimited` (and so `RateLimitedError`) is deliberately **not** a `GatewayError`. A 429
+means the gateway is healthy and saying so; the circuit breaker does not count it, or "slow
+down" becomes "stop". Measured on a real run: 17 rate limits opened a breaker and the next 62
+calls failed instantly without a request ever being sent. Code that catches `GatewayError` to
+count failures has therefore never seen a 429, and the typed `RateLimitedError` keeps it so.
 
 `EmptyResponse` exists because reasoning models spend the output budget on thinking before
 emitting anything, so too small a `max_tokens` returns 200 OK with `""` and
@@ -359,19 +394,33 @@ breaker.
 
 The wait comes from `Retry-After` when the gateway sends one, as a delay or an HTTP date, and
 from the *body* when it does not: Gemini answers "Please retry in 59.18s" with no header at
-all. Without either, it is `backoff_seconds * 2**attempt`. No wait is longer than 60 seconds.
+all. That delay is used as given, without jitter — the gateway knows when it will have room.
+Without either, the wait is **exponential backoff with full jitter**: a uniform draw from
+`[0, backoff_seconds * 2**attempt)`, so processes that failed together do not all retry in
+the same instant when the gateway comes back. No wait is longer than 30 seconds
+(`bifrost_sdk._retry.MAX_WAIT`), whoever asked for it.
 
 After `circuit_failure_threshold` consecutive failed calls (default 5; 0 disables it) the
 client fails fast with `CircuitOpen` for `circuit_open_seconds`, so an outage costs one
 timeout rather than one per request. A call whose retries are all spent counts once. After
 the window the next call is sent: a success closes the circuit, a failure opens it again.
-`stream`, tool execution and management calls neither check nor feed the breaker.
+
+Only failures that say the *gateway* is unwell count: transport failures (connect errors,
+timeouts, a connection lost mid-stream), any 5xx, and a `200` whose body is unusable. No 4xx
+counts — not a 429 (backpressure), not a 400, 404 or 422 (a verdict on that request: a few
+over-long prompts must not fail every other agent sharing the client), and not a 401 or 403
+either (one mis-keyed caller must not take the gateway away from the correctly keyed ones).
+A 4xx neither adds to a streak of failures nor ends it.
+
+`chat`, `json`, `complete` and `stream` check and feed the breaker; a stream counts once it
+is accepted (success) or when it fails to start or loses its connection (failure). Tool
+execution and management calls neither check nor feed it.
 
 ## Tests
 
 ```bash
-uv run pytest                                            # unit tests, gateway mocked
-BIFROST_LIVE_URL=http://localhost:8091/v1 uv run pytest -m live  # against a running gateway
+uv run pytest                                                # unit tests, gateway mocked
+BIFROST_URL=http://localhost:8091/v1 uv run pytest -m live   # against a running gateway
 ```
 
 The unit tests never touch the network: the gateway is an `httpx.MockTransport`, or `respx`
@@ -380,8 +429,11 @@ where the test lets the SDK build its own HTTP client. They cover every line and
 
 The live tests register temporary MCP clients (`BIFROST_LIVE_MCP_URL`, default the public
 DeepWiki server, which publishes no annotations; `BIFROST_LIVE_ANNOTATED_MCP_URL`, default the
-public Context7 server, which does) and remove them afterwards; they skip when
-`BIFROST_LIVE_URL` is unset or the gateway is unreachable.
+public Context7 server, which does) and remove them afterwards; they skip when `BIFROST_URL`
+is unset or the gateway is unreachable. `BIFROST_URL` is the name every repository in the
+platform uses for the gateway; the older `BIFROST_LIVE_URL` is still read when it is unset.
+A plain `uv run pytest` deselects them (`addopts` in `pyproject.toml`), because `BIFROST_URL`
+is often set in a shell that did not mean to register clients on that gateway.
 
 CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check` and the unit tests on
 every pull request and on pushes to `main`.

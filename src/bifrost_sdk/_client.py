@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json as jsonlib
+import random
 import re
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime
@@ -27,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from bifrost_sdk._api import CONNECT_TIMEOUT, ManagementAPI, management_client, origin
+from bifrost_sdk._api import ManagementAPI, limits, management_client, origin, timeouts
 from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._errors import (
     ERROR_STATUS,
@@ -48,7 +49,7 @@ from bifrost_sdk._mcp import (
     scope,
     server_files,
 )
-from bifrost_sdk._retry import RETRYABLE, backoff
+from bifrost_sdk._retry import MAX_WAIT, RETRYABLE, Jitter, backoff
 from bifrost_sdk.headers import Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
@@ -56,6 +57,11 @@ Messages = str | Sequence[dict[str, Any]]
 
 #: The gateway's maximum page size for ``GET /api/mcp-logs``.
 MAX_LOG_PAGE = 1000
+
+#: How many Code Mode declaration files are read at once. Each is one small JSON-RPC call;
+#: reading them one after another made listing cost a round trip per Code Mode server, and
+#: reading every one at once would let a gateway with many servers take the whole pool.
+CODE_MODE_READS = 4
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
@@ -92,10 +98,17 @@ class Bifrost:
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required (the gateway's /v1 endpoint)")
+        if max_retries < 0:
+            # Zero attempts would fail every call without sending it, as a "request failed"
+            # that counts toward the breaker.
+            raise ValueError("max_retries must be 0 or more")
         self.model = model
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
+        #: Jitter for the retry backoff; a seeded ``random.Random`` makes a schedule
+        #: reproducible.
+        self._rng: Jitter = random.Random()
         #: Retries handle one bad call; the breaker handles a bad gateway. Without it an
         #: outage costs one full timeout *per request* — with it, one in total. Pass
         #: ``circuit_failure_threshold=0`` to turn it off and see every failure yourself.
@@ -108,7 +121,8 @@ class Bifrost:
         self._client = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers=headers,
-            timeout=httpx.Timeout(timeout, connect=min(CONNECT_TIMEOUT, timeout)),
+            timeout=timeouts(timeout),
+            limits=limits(),
         )
         self._owns_client = client is None
         #: ``/api/*`` (MCP listing, logs, client CRUD) authenticates with a bearer token,
@@ -191,7 +205,12 @@ class Bifrost:
 
         Nothing is buffered: time-to-first-token is the point of streaming, and collecting the
         whole answer before yielding would throw it away. Streams are not retried — a partly
-        consumed stream cannot be replayed without showing the caller duplicate text.
+        consumed stream cannot be replayed without showing the caller duplicate text — but
+        they do use the breaker: an open circuit raises :class:`CircuitOpen` before anything
+        is sent, an accepted stream counts as a success, and a failure to start (or a
+        connection lost mid-stream) counts as the completions' failures do. An error the
+        gateway reports inside the stream is raised as a :class:`GatewayError` rather than
+        ending the text early as though it were complete.
         """
         body = self._body(
             prompt,
@@ -202,14 +221,18 @@ class Bifrost:
             tools=tools,
             extra=extra,
         ) | {"stream": True}
+        headers = options.headers() if options is not None else None
+        self._breaker.check()
         try:
-            headers = options.headers() if options is not None else None
             async with self._client.stream(
                 "POST", "/chat/completions", json=body, headers=headers
             ) as response:
                 if response.status_code >= ERROR_STATUS:
                     await response.aread()
-                    raise from_response(response)
+                    error = from_response(response)
+                    self._breaker.record_failure(error)
+                    raise error
+                self._breaker.record_success()
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -220,7 +243,9 @@ class Bifrost:
                     if delta:
                         yield delta
         except httpx.TransportError as exc:
-            raise unreachable(exc) from exc
+            failure = unreachable(exc)
+            self._breaker.record_failure(failure)
+            raise failure from exc
 
     # ----------------------------------------------------------------- the raw payload
 
@@ -286,11 +311,30 @@ class Bifrost:
         listed = [t for t in result.get("tools") or () if isinstance(t, dict) and "name" in t]
         tools = [listed_tool(t) for t in listed if t["name"] not in CODE_MODE_META_TOOLS]
         if any(t["name"] in CODE_MODE_META_TOOLS for t in listed):
-            files = await self._meta_text("listToolFiles", {})
-            for client in server_files(files):
-                text = await self._meta_text("readToolFile", {"fileName": f"servers/{client}.pyi"})
+            clients = server_files(await self._meta_text("listToolFiles", {}))
+            texts = await self._declarations(clients)
+            for client, text in zip(clients, texts, strict=True):
                 tools.extend(declared_tools(client, text))
         return tools
+
+    async def _declarations(self, clients: list[str]) -> list[str]:
+        """Each Code Mode client's ``readToolFile`` text, in ``clients`` order.
+
+        Read :data:`CODE_MODE_READS` at a time. Every read is awaited before any failure is
+        raised, and the one raised is the first *in order*, so the listing fails the same way
+        however the reads interleave — and no read is left running unobserved behind it.
+        """
+        gate = asyncio.Semaphore(CODE_MODE_READS)
+
+        async def read(client: str) -> str:
+            async with gate:
+                return await self._meta_text("readToolFile", {"fileName": f"servers/{client}.pyi"})
+
+        results = await asyncio.gather(*(read(c) for c in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return [str(result) for result in results]
 
     async def _meta_text(self, name: str, arguments: dict[str, Any]) -> str:
         """A Code Mode meta-tool's text answer, called through the gateway's MCP endpoint."""
@@ -372,10 +416,7 @@ class Bifrost:
             raise unreachable(exc) from exc
         if response.status_code >= ERROR_STATUS:
             raise from_response(response)
-        try:
-            return dict(response.json())
-        except ValueError as exc:
-            raise GatewayError("tool execution returned a non-JSON body") from exc
+        return _json_object(response, "tool execution")
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -461,7 +502,7 @@ class Bifrost:
         self._breaker.check()
         error: Exception | None = None
         for attempt in range(self.max_retries + 1):
-            wait = backoff(attempt, self.backoff_seconds)
+            wait = backoff(attempt, self.backoff_seconds, self._rng)
             try:
                 response = await self._client.post("/chat/completions", **request)
             except httpx.TransportError as exc:
@@ -469,20 +510,23 @@ class Bifrost:
             else:
                 if response.status_code < ERROR_STATUS:
                     try:
-                        payload = dict(response.json())
-                    except ValueError as exc:
+                        payload = _json_object(response, "gateway")
+                    except GatewayError as exc:
                         # A 200 the caller cannot use is still the gateway misbehaving.
-                        self._breaker.record_failure()
-                        raise GatewayError("gateway returned a non-JSON body") from exc
+                        self._breaker.record_failure(exc)
+                        raise
                     self._breaker.record_success()
                     return payload
                 error = from_response(response)
                 if response.status_code not in RETRYABLE:
+                    # Recorded, but a 4xx does not count: the breaker decides (_breaker.counts).
                     self._breaker.record_failure(error)
                     raise error
+                # A delay the gateway asked for is honoured as given — no jitter: it already
+                # knows when it will have room — up to MAX_WAIT.
                 wait = getattr(error, "retry_after", None) or wait
             if attempt < self.max_retries:
-                await asyncio.sleep(min(wait, 60.0))
+                await asyncio.sleep(min(wait, MAX_WAIT))
         # The retries are spent. This counts once, not once per attempt: the breaker
         # measures failed *calls*, and a threshold of 5 would otherwise open after two.
         self._breaker.record_failure(error)
@@ -527,13 +571,36 @@ def _parse_json(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _json_object(response: httpx.Response, what: str) -> dict[str, Any]:
+    """A success response's body, which must be one JSON object."""
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise GatewayError(f"{what} returned a non-JSON body", body=response.text[:300]) from exc
+    if not isinstance(payload, dict):
+        raise GatewayError(f"{what} returned JSON that is not an object", body=response.text[:300])
+    return payload
+
+
 def _delta(data: str) -> str:
+    """One ``data:`` chunk's text; ``""`` for anything that is not text.
+
+    A chunk carrying ``error`` (and no choices) is the gateway reporting a failure after the
+    stream began — the provider dropped, a filter tripped — and is raised: skipping it made a
+    truncated answer look like a finished one.
+    """
     try:
         chunk = jsonlib.loads(data)
     except ValueError:
         return ""
-    choices = chunk.get("choices") or [{}]
-    return str((choices[0].get("delta") or {}).get("content") or "")
+    if not isinstance(chunk, dict):
+        return ""
+    choices = chunk.get("choices")
+    if not choices and chunk.get("error"):
+        raise GatewayError("gateway reported an error mid-stream", body=data[:300])
+    first = choices[0] if isinstance(choices, list) and choices else None
+    delta = first.get("delta") if isinstance(first, dict) else None
+    return str(delta.get("content") or "") if isinstance(delta, dict) else ""
 
 
 __all__ = ["Bifrost", "Messages"]
