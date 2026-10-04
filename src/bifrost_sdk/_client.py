@@ -384,10 +384,10 @@ class Bifrost:
 
         Success, not merely "answered". It used to accept anything below 500, which makes
         the check unable to fail in the one case it exists for: a ``base_url`` pointing at
-        something that is not this gateway. That is not hypothetical — the default here is
-        ``localhost:8090/v1``, and on the machine this was written on a *different* service
-        held port 8090 and answered 404, so a misconfigured deployment reported its model
-        dependency healthy and failed on every actual call.
+        something that is not this gateway. That is not hypothetical — the memory service's
+        default was ``localhost:8090/v1``, and on the machine this was written on a
+        *different* service held port 8090 and answered 404, so a misconfigured deployment
+        reported its model dependency healthy and failed on every actual call.
 
         A 401 or 404 on ``/models`` means the same request to ``/chat/completions``, which
         is all this client ever sends, will not work either. Reporting that as up is worse
