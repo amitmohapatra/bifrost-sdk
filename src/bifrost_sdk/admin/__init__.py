@@ -1,4 +1,5 @@
-"""Gateway administration: virtual keys, governance, routing rules, prompts, skills.
+"""Gateway administration: virtual keys, governance, routing rules, prompts, skills and
+Virtual MCPs.
 
 Operator tooling, kept apart from :class:`~bifrost_sdk.Bifrost` so an application's client
 carries only what an application calls::
@@ -20,6 +21,7 @@ from bifrost_sdk.admin.governance import Governance, VirtualKeys
 from bifrost_sdk.admin.prompts import Prompt, Prompts, PromptVersion
 from bifrost_sdk.admin.routing import Routing
 from bifrost_sdk.admin.skills import Skill, SkillFile, Skills, SkillVersion
+from bifrost_sdk.admin.virtual_mcps import VirtualMCP, VirtualMCPs
 
 
 class Admin:
@@ -43,6 +45,7 @@ class Admin:
         self.routing = Routing(api)
         self.prompts = Prompts(api)
         self.skills = Skills(api)
+        self.virtual_mcps = VirtualMCPs(api)
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -67,4 +70,6 @@ __all__ = [
     "SkillVersion",
     "Skills",
     "VirtualKeys",
+    "VirtualMCP",
+    "VirtualMCPs",
 ]

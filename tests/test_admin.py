@@ -628,3 +628,91 @@ async def test_a_missing_skill_file_is_not_found() -> None:
     with pytest.raises(NotFoundError):
         await admin.skills.read_file("sql-review", "nope.md")
     await admin.aclose()
+
+
+VMCP = {
+    "id": 3,
+    "name": "Finance Tools",
+    "endpoint_slug": "finance-tools",
+    "enabled": True,
+    "tools": [{"mcp_client_id": "c-erp", "tool_names": ["get_stock"]},
+              {"mcp_client_id": "c-crm", "tool_names": ["*"]}],
+    "virtual_key_ids": ["vk-1"],
+    "created_at": "2026-10-05T19:23:11Z",
+    "updated_at": "2026-10-05T19:23:11Z",
+}  # fmt: skip
+
+
+async def test_a_virtual_mcp_reads_typed() -> None:
+    _, handler = answering({("GET", "/api/mcp/virtual-mcps/3"): {"virtual_mcp": VMCP}})
+    admin = client(handler)
+    vmcp = await admin.virtual_mcps.get(3)
+    assert (vmcp.id, vmcp.slug, vmcp.enabled, vmcp.description) == (
+        3,
+        "finance-tools",
+        True,
+        None,
+    )
+    assert vmcp.tools == {"c-erp": ("get_stock",), "c-crm": ("*",)}
+    assert vmcp.virtual_key_ids == ("vk-1",)
+    await admin.aclose()
+
+
+async def test_creating_a_virtual_mcp_sends_tool_specs_by_client_id() -> None:
+    created = VMCP | {"virtual_key_ids": []}
+    seen, handler = answering({("POST", "/api/mcp/virtual-mcps"): {"virtual_mcp": created}})
+    admin = client(handler)
+    tools = {"c-erp": ["get_stock"], "c-crm": ("*",)}
+    await admin.virtual_mcps.create("Finance Tools", tools)
+    await admin.virtual_mcps.create(
+        "Finance Tools", tools, slug="fin", description="ERP reads", enabled=False
+    )
+    specs = [
+        {"mcp_client_id": "c-erp", "tool_names": ["get_stock"]},
+        {"mcp_client_id": "c-crm", "tool_names": ["*"]},
+    ]
+    assert [body for _, _, _, body in seen] == [
+        {"name": "Finance Tools", "tools": specs, "enabled": True},
+        {"name": "Finance Tools", "tools": specs, "enabled": False,
+         "endpoint_slug": "fin", "description": "ERP reads"},
+    ]  # fmt: skip
+    await admin.aclose()
+
+
+async def test_updating_a_virtual_mcp_sends_only_what_changes() -> None:
+    """The gateway keeps every field the body leaves out (and ignores a slug)."""
+    seen, handler = answering({("PUT", "/api/mcp/virtual-mcps/3"): {"virtual_mcp": VMCP}})
+    admin = client(handler)
+    await admin.virtual_mcps.update(3, enabled=False)
+    await admin.virtual_mcps.update(3, name="Fin", description="d", tools={"c-erp": []})
+    emptied = [{"mcp_client_id": "c-erp", "tool_names": []}]
+    assert [body for _, _, _, body in seen] == [
+        {"enabled": False},
+        {"name": "Fin", "description": "d", "tools": emptied},
+    ]
+    await admin.aclose()
+
+
+async def test_virtual_mcps_list_attach_detach_and_delete() -> None:
+    seen, handler = answering(
+        {
+            ("GET", "/api/mcp/virtual-mcps"): {"virtual_mcps": [VMCP], "count": 1},
+            ("POST", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2"): {"success": True},
+            ("DELETE", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2"): {"success": True},
+            ("DELETE", "/api/mcp/virtual-mcps/3"): {"success": True},
+        }
+    )
+    admin = client(handler)
+    assert [v.slug for v in await admin.virtual_mcps.list(search="fin")] == ["finance-tools"]
+    await admin.virtual_mcps.list()
+    assert await admin.virtual_mcps.attach(3, "vk-2") is None
+    await admin.virtual_mcps.detach(3, "vk-2")
+    await admin.virtual_mcps.delete(3)
+    assert [(m, p, q) for m, p, q, _ in seen] == [
+        ("GET", "/api/mcp/virtual-mcps", {"search": "fin", "limit": "100", "offset": "0"}),
+        ("GET", "/api/mcp/virtual-mcps", {"limit": "100", "offset": "0"}),
+        ("POST", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2", {}),
+        ("DELETE", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2", {}),
+        ("DELETE", "/api/mcp/virtual-mcps/3", {}),
+    ]
+    await admin.aclose()
