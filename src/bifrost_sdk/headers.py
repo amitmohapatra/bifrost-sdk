@@ -25,6 +25,18 @@ MCP_CLIENTS = "x-bf-mcp-include-clients"
 MCP_TOOLS = "x-bf-mcp-include-tools"
 MCP_SESSION = "x-bf-mcp-session-id"
 
+#: On every completion: the MCP scope headers present and empty, the gateway's deny-all.
+#: Without them a completion under a key with MCP access has the key's tools added to the
+#: request — the model is offered tools the caller never declared (measured: "say hi" cost
+#: 272 prompt tokens with one two-tool server granted, 32 under deny-all) — and the gateway's
+#: agent loop runs, itself, any tool call naming a tool in a client's
+#: ``tools_to_auto_execute``: a call no caller-side governance or record sees. Under deny-all
+#: nothing is added and that execution is refused (logged as an error, never run). The loop
+#: itself is not switched off by any header: with such a client, the refusal is fed back to
+#: the model and the reply that returns is its answer to that. Keep ``tools_to_auto_execute``
+#: empty (:class:`MCPClientConfig` does).
+NO_GATEWAY_TOOLS = {MCP_CLIENTS: "", MCP_TOOLS: ""}
+
 #: Correlation. Tool executions made under this header are logged with it as their
 #: ``llm_request_id``, which is how Code Mode's nested calls are found again in the MCP logs.
 PARENT_REQUEST_ID = "x-bf-parent-request-id"

@@ -51,7 +51,7 @@ from bifrost_sdk._mcp import (
     server_files,
 )
 from bifrost_sdk._retry import MAX_WAIT, RETRYABLE, Jitter, backoff
-from bifrost_sdk.headers import MCP_CLIENTS, MCP_TOOLS, Options
+from bifrost_sdk.headers import NO_GATEWAY_TOOLS, Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
@@ -65,18 +65,6 @@ MAX_LOG_PAGE = 1000
 CODE_MODE_READS = 4
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
-
-#: On every completion: the MCP scope headers present and empty, the gateway's deny-all.
-#: Without them a completion under a key with MCP access has the key's tools added to the
-#: request — the model is offered tools the caller never declared (measured: "say hi" cost
-#: 272 prompt tokens with one two-tool server granted, 32 under deny-all) — and the gateway's
-#: agent loop runs, itself, any tool call naming a tool in a client's
-#: ``tools_to_auto_execute``: a call no caller-side governance or record sees. Under deny-all
-#: nothing is added and that execution is refused (logged as an error, never run). The loop
-#: itself is not switched off by any header: with such a client, the refusal is fed back to
-#: the model and the reply that returns is its answer to that. Keep ``tools_to_auto_execute``
-#: empty (:class:`MCPClientConfig` does).
-NO_GATEWAY_TOOLS = {MCP_CLIENTS: "", MCP_TOOLS: ""}
 
 
 def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
