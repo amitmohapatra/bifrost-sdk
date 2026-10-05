@@ -435,8 +435,6 @@ async def test_options_send_every_field_as_its_gateway_header() -> None:
     options = Options(
         prompt_id="p-123",
         prompt_version=3,
-        mcp_clients=["memory"],
-        mcp_tools=["memory-recall"],
         parent_request_id="run-1",
         session_id="thread-9",
         customer_id="acme",
@@ -447,8 +445,8 @@ async def test_options_send_every_field_as_its_gateway_header() -> None:
     assert seen["headers"] == {
         "x-bf-prompt-id": "p-123",
         "x-bf-prompt-version": "3",
-        "x-bf-mcp-include-clients": "memory",
-        "x-bf-mcp-include-tools": "memory-recall",
+        "x-bf-mcp-include-clients": "",
+        "x-bf-mcp-include-tools": "",
         "x-bf-parent-request-id": "run-1",
         "x-bf-session-id": "thread-9",
         "x-bf-customer-id": "acme",
@@ -459,12 +457,33 @@ async def test_options_send_every_field_as_its_gateway_header() -> None:
     await bf.aclose()
 
 
-async def test_no_options_sends_no_gateway_headers_at_all() -> None:
-    """An empty header is not the same as an absent one: for MCP scope it means deny-all."""
+#: What every completion carries, options or not.
+DENY_ALL = {"x-bf-mcp-include-clients": "", "x-bf-mcp-include-tools": ""}
+
+
+async def test_without_options_a_completion_sends_only_the_mcp_deny_all() -> None:
+    """An empty header is not an absent one: present-and-empty is the gateway's deny-all, so
+    a completion is offered no gateway MCP tool and the gateway runs none (_client)."""
     seen, handler = _capture()
     bf = client(handler)
     await bf.chat("hi")
-    assert seen["headers"] == {}
+    assert seen["headers"] == DENY_ALL
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    "options", [Options(mcp_clients=["memory"]), Options(mcp_tools=["memory-recall"])]
+)
+async def test_a_completion_refuses_an_mcp_scope_before_sending(options) -> None:
+    """A scope on a completion would let the gateway add those tools: refused, not sent."""
+    calls: list[httpx.Request] = []
+    bf = client(lambda request: calls.append(request) or reply("ok"))
+    with pytest.raises(ValueError, match="never carries the gateway's MCP tools"):
+        await bf.chat("hi", options=options)
+    with pytest.raises(ValueError, match="never carries"):
+        [d async for d in bf.stream("hi", options=options)]
+    assert calls == []
+    assert await bf.chat("hi", options=Options(mcp_clients=(), mcp_tools=())) == "ok"
     await bf.aclose()
 
 
@@ -495,7 +514,7 @@ async def test_private_opts_out_of_content_logging() -> None:
     seen, handler = _capture()
     bf = client(handler)
     await bf.chat("my card number is ...", options=Options(content_logging=False))
-    assert seen["headers"] == {"x-bf-disable-content-logging": "true"}
+    assert seen["headers"] == {"x-bf-disable-content-logging": "true"} | DENY_ALL
     await bf.aclose()
 
 
@@ -536,11 +555,9 @@ async def test_streaming_carries_options_too() -> None:
         return httpx.Response(200, text=body)
 
     bf = client(handler)
-    options = Options(session_id="s-2", mcp_clients=["memory"])
-    deltas = [d async for d in bf.stream("go", options=options)]
+    deltas = [d async for d in bf.stream("go", options=Options(session_id="s-2"))]
     assert deltas == ["hi"]
-    assert seen["headers"]["x-bf-session-id"] == "s-2"
-    assert seen["headers"]["x-bf-mcp-include-clients"] == "memory"
+    assert seen["headers"] == {"x-bf-session-id": "s-2"} | DENY_ALL
     await bf.aclose()
 
 

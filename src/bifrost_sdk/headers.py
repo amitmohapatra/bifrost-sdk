@@ -58,7 +58,10 @@ class Options:
     """Per-request gateway options, rendered to ``x-bf-*`` headers. Unset options send nothing.
 
     ``mcp_clients`` / ``mcp_tools``: ``None`` leaves MCP unscoped, an empty sequence denies
-    every client or tool (the header is sent empty — the gateway's deny-all).
+    every client or tool (the header is sent empty — the gateway's deny-all). They scope
+    ``execute_tool``: a completion always sends both empty and refuses any other scope.
+    ``mcp_session_id`` names the caller for per-user MCP credentials when the virtual key
+    does not; a per-user credential header the server reads goes in ``extra``.
     ``extra`` holds any other header, e.g. one a routing rule matches on.
     """
 

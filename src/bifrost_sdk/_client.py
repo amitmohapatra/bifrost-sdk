@@ -50,7 +50,7 @@ from bifrost_sdk._mcp import (
     server_files,
 )
 from bifrost_sdk._retry import MAX_WAIT, RETRYABLE, Jitter, backoff
-from bifrost_sdk.headers import Options
+from bifrost_sdk.headers import MCP_CLIENTS, MCP_TOOLS, Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
@@ -65,19 +65,43 @@ CODE_MODE_READS = 4
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
+#: On every completion: the MCP scope headers present and empty, the gateway's deny-all.
+#: Without them a completion under a key with MCP access has the key's tools added to the
+#: request — the model is offered tools the caller never declared (measured: "say hi" cost
+#: 272 prompt tokens with one two-tool server granted, 32 under deny-all) — and the gateway's
+#: agent loop runs, itself, any tool call naming a tool in a client's
+#: ``tools_to_auto_execute``: a call no caller-side governance or record sees. Under deny-all
+#: nothing is added and that execution is refused (logged as an error, never run). The loop
+#: itself is not switched off by any header: with such a client, the refusal is fed back to
+#: the model and the reply that returns is its answer to that. Keep ``tools_to_auto_execute``
+#: empty (:class:`MCPClientConfig` does).
+NO_GATEWAY_TOOLS = {MCP_CLIENTS: "", MCP_TOOLS: ""}
+
 
 def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
     turns = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
     return [{"role": "system", "content": system}, *turns] if system else turns
 
 
+def _completion_headers(options: Options | None) -> dict[str, str]:
+    """A completion's ``x-bf-*`` headers: ``options``, and never the gateway's MCP tools."""
+    if options is not None and (options.mcp_clients or options.mcp_tools):
+        raise ValueError(
+            "a completion never carries the gateway's MCP tools: mcp_clients/mcp_tools scope "
+            "execute_tool(); pass the tools to offer as tools="
+        )
+    return (options.headers() if options is not None else {}) | NO_GATEWAY_TOOLS
+
+
 class Bifrost:
     """One gateway, one default model, three verbs.
 
     Every verb takes ``options=`` (:class:`~bifrost_sdk.headers.Options`) for per-request
-    gateway behaviour. Everything below the public methods exists because a real gateway did
-    it to us: rate limits that carry their delay in the body, reasoning models that answer
-    with nothing, and a circuit breaker that must not confuse "slow down" with "broken".
+    gateway behaviour, and never lets the gateway add or run MCP tools
+    (:data:`NO_GATEWAY_TOOLS`): a model is offered the tools passed as ``tools=``, no others.
+    Everything below the public methods exists because a real gateway did it to us: rate
+    limits that carry their delay in the body, reasoning models that answer with nothing,
+    and a circuit breaker that must not confuse "slow down" with "broken".
     """
 
     def __init__(
@@ -221,7 +245,7 @@ class Bifrost:
             tools=tools,
             extra=extra,
         ) | {"stream": True}
-        headers = options.headers() if options is not None else None
+        headers = _completion_headers(options)
         self._breaker.check()
         try:
             async with self._client.stream(
@@ -494,11 +518,9 @@ class Bifrost:
     ) -> dict[str, Any]:
         # httpx reads an explicit timeout=None as "wait forever", so the argument is omitted
         # rather than passed through when the caller has no deadline of their own.
-        request: dict[str, Any] = {"json": body}
+        request: dict[str, Any] = {"json": body, "headers": _completion_headers(options)}
         if timeout is not None:
             request["timeout"] = timeout
-        if options is not None and (extra := options.headers()):
-            request["headers"] = extra
         self._breaker.check()
         error: Exception | None = None
         for attempt in range(self.max_retries + 1):
