@@ -331,14 +331,7 @@ class MCP(Resource):
         """Every registered client, across all pages, with its tools' annotations (an admin
         listing: with admin auth on it needs ``admin_token``; :meth:`Bifrost.tools` is what a
         virtual key may list)."""
-        entries: list[dict[str, Any]] = []
-        while True:
-            page = await self._api.items(
-                "/api/mcp/clients", ("clients",), limit=_PAGE, offset=len(entries)
-            )
-            entries.extend(page)
-            if len(page) < _PAGE:
-                break
+        entries = await self._api.pages("/api/mcp/clients", ("clients",), _PAGE)
         listed = await self._listing() if any(e.get("tools") for e in entries) else {}
         annotations = {name: hints for name, hints in (listed or {}).items() if hints is not None}
         return [MCPClient._from_gateway(entry, annotations) for entry in entries]
