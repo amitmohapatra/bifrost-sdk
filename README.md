@@ -239,6 +239,8 @@ and records. Under deny-all nothing is added and that execution is refused (the 
 it as an error). No header turns the loop itself off: with such a client, the gateway feeds its
 refusal back to the model and returns the model's answer to that, so keep
 `tools_to_auto_execute` empty (the default). The live suite checks both against the gateway.
+A framework's own model client pointed at the gateway sends the same headers, exported as
+`bifrost_sdk.NO_GATEWAY_TOOLS` (`{"x-bf-mcp-include-clients": "", "x-bf-mcp-include-tools": ""}`).
 
 **Stored prompts.** `Options(prompt_id=..., prompt_version=...)` has the gateway prepend
 that version's messages to the request's own and apply its `model_params` wherever the

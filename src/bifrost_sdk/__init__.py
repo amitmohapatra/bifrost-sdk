@@ -43,9 +43,10 @@ from bifrost_sdk._mcp import (
     ToolDef,
 )
 from bifrost_sdk._retry import RETRYABLE
-from bifrost_sdk.headers import Options
+from bifrost_sdk.headers import NO_GATEWAY_TOOLS, Options
 
 __all__ = [
+    "NO_GATEWAY_TOOLS",
     "RETRYABLE",
     "AuthenticationError",
     "BadRequestError",
