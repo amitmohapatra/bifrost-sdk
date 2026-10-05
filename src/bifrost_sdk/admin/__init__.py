@@ -17,9 +17,9 @@ import httpx
 
 from bifrost_sdk._api import ManagementAPI, management_client
 from bifrost_sdk.admin.governance import Governance, VirtualKeys
-from bifrost_sdk.admin.prompts import Prompts
+from bifrost_sdk.admin.prompts import Prompt, Prompts, PromptVersion
 from bifrost_sdk.admin.routing import Routing
-from bifrost_sdk.admin.skills import Skills
+from bifrost_sdk.admin.skills import Skill, SkillFile, Skills, SkillVersion
 
 
 class Admin:
@@ -55,4 +55,16 @@ class Admin:
         await self.aclose()
 
 
-__all__ = ["Admin", "Governance", "Prompts", "Routing", "Skills", "VirtualKeys"]
+__all__ = [
+    "Admin",
+    "Governance",
+    "Prompt",
+    "PromptVersion",
+    "Prompts",
+    "Routing",
+    "Skill",
+    "SkillFile",
+    "SkillVersion",
+    "Skills",
+    "VirtualKeys",
+]
