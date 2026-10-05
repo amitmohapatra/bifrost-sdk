@@ -12,7 +12,13 @@ import httpx
 import pytest
 import respx
 
-from bifrost_sdk import GatewayError, PermissionDeniedError, RateLimited, Unreachable
+from bifrost_sdk import (
+    GatewayError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimited,
+    Unreachable,
+)
 from bifrost_sdk.admin import Admin
 
 
@@ -37,31 +43,10 @@ def record(payload, status=200):
     return seen, handler
 
 
-# ----------------------------------------------------------------- prompts / skills
-
-
-async def test_prompt_versions_use_the_nested_route() -> None:
-    seen, handler = record({"versions": [{"version": 3}]})
-    admin = client(handler)
-    assert await admin.prompts.versions("p-1") == [{"version": 3}]
-    assert seen["path"] == "/api/prompt-repo/prompts/p-1/versions"
-    await admin.aclose()
-
-
-async def test_skill_version_shift_is_a_post_not_an_update() -> None:
-    """Serving is decoupled from publishing: rollback points at an existing version."""
-    seen, handler = record({"served": "1.2.0"})
-    admin = client(handler)
-    await admin.skills.shift_version("s-1", "1.2.0")
-    assert (seen["method"], seen["path"]) == ("POST", "/api/skills/s-1/shift-version")
-    assert seen["body"] == {"version": "1.2.0"}
-    await admin.aclose()
-
-
 async def test_a_list_endpoint_without_an_envelope_still_works() -> None:
-    _seen, handler = record([{"id": "s1"}])
+    _seen, handler = record([{"id": "vk1"}])
     admin = client(handler)
-    assert await admin.skills.list() == [{"id": "s1"}]
+    assert await admin.vk.list() == [{"id": "vk1"}]
     await admin.aclose()
 
 
@@ -229,28 +214,8 @@ ROUTES = [
      "/api/routing/complexity-analyzer-config", {}, {"enabled": True}, ITEM, ITEM),
     (lambda a: a.routing.complexity_status(), "GET", "/api/routing/complexity-analyzer-status",
      {}, None, {"ready": False}, {"ready": False}),
-    (lambda a: a.prompts.list(folder_id="f"), "GET", "/api/prompt-repo/prompts",
-     {"folder_id": "f"}, None, {"prompts": [ITEM]}, [ITEM]),
-    (lambda a: a.prompts.get("p1"), "GET", "/api/prompt-repo/prompts/p1", {}, None, ITEM, ITEM),
-    (lambda a: a.prompts.create("triage", folder_id="f"), "POST", "/api/prompt-repo/prompts",
-     {}, {"name": "triage", "folder_id": "f"}, ITEM, ITEM),
-    (lambda a: a.prompts.update("p1", name="t2"), "PUT", "/api/prompt-repo/prompts/p1",
-     {}, {"name": "t2"}, ITEM, ITEM),
-    (lambda a: a.prompts.delete("p1"), "DELETE", "/api/prompt-repo/prompts/p1",
-     {}, None, None, None),
-    (lambda a: a.prompts.add_version("p1", commit_message="v2"), "POST",
-     "/api/prompt-repo/prompts/p1/versions", {}, {"commit_message": "v2"}, ITEM, ITEM),
-    (lambda a: a.prompts.version("v1"), "GET", "/api/prompt-repo/versions/v1",
-     {}, None, ITEM, ITEM),
     (lambda a: a.prompts.folders(), "GET", "/api/prompt-repo/folders",
      {}, None, {"folders": [ITEM]}, [ITEM]),
-    (lambda a: a.skills.get("s1"), "GET", "/api/skills/s1", {}, None, ITEM, ITEM),
-    (lambda a: a.skills.create("triage", description="d"), "POST", "/api/skills",
-     {}, {"name": "triage", "description": "d"}, ITEM, ITEM),
-    (lambda a: a.skills.update("s1", description="e"), "PUT", "/api/skills/s1",
-     {}, {"description": "e"}, ITEM, ITEM),
-    (lambda a: a.skills.versions("s1"), "GET", "/api/skills/s1/versions",
-     {}, None, {"versions": [ITEM]}, [ITEM]),
 ]  # fmt: skip
 
 
@@ -321,3 +286,433 @@ async def test_without_a_token_no_authorization_is_sent(respx_mock: respx.MockRo
     async with Admin("http://gateway.test") as admin:
         await admin.routing.rules()
     assert "Authorization" not in route.calls.last.request.headers
+
+
+# ----------------------------------------------------------------- typed repositories
+#
+# The answers below are the running gateway's, captured from it (ids and times shortened):
+# every one is wrapped ({"prompt": ...}, {"skill": ...}, {"virtual_mcp": ...}).
+
+
+def answering(answers: dict[tuple[str, str], object]):
+    """A gateway that answers each ``(method, path)`` with its JSON (or ``answer(request)``)
+    and records ``(method, path, query, body)`` per request."""
+    seen: list[tuple[str, str, dict, object]] = []
+
+    def handler(request):
+        body = jsonlib.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, dict(request.url.params), body))
+        answer = answers[(request.method, request.url.path)]
+        return httpx.Response(200, json=answer(request) if callable(answer) else answer)
+
+    return seen, handler
+
+
+VERSION = {
+    "id": 7,
+    "prompt_id": "p-1",
+    "version_number": 2,
+    "commit_message": "pirate",
+    "model_params": {"temperature": 0},
+    "provider": "local",
+    "model": "small-model",
+    "is_latest": True,
+    "created_at": "2026-10-05T19:26:24.531834523Z",
+    "messages": [
+        {"id": 2, "prompt_id": "p-1", "version_id": 7, "order_index": 1,
+         "message": {"role": "user", "content": "Ahoy?"}},
+        {"id": 1, "prompt_id": "p-1", "version_id": 7, "order_index": 0,
+         "message": {"role": "system", "content": "Answer ARRR."}},
+    ],
+}  # fmt: skip
+PROMPT = {
+    "id": "p-1",
+    "name": "pirate",
+    "created_at": "2026-10-05T19:26:24.52593946Z",
+    "updated_at": "2026-10-05T19:26:24.52593946Z",
+    "latest_version": VERSION,
+}
+#: A prompt as created: no folder, no version yet.
+BARE_PROMPT = {key: PROMPT[key] for key in ("id", "name", "created_at", "updated_at")}
+
+
+async def test_a_prompt_reads_typed_with_its_messages_in_template_order() -> None:
+    seen, handler = answering({("GET", "/api/prompt-repo/prompts/p-1"): {"prompt": PROMPT}})
+    admin = client(handler)
+    prompt = await admin.prompts.get("p-1")
+    assert (prompt.id, prompt.name, prompt.folder_id) == ("p-1", "pirate", None)
+    version = prompt.latest_version
+    assert version is not None
+    assert (version.id, version.number, version.is_latest) == (7, 2, True)
+    assert version.messages == (
+        {"role": "system", "content": "Answer ARRR."},
+        {"role": "user", "content": "Ahoy?"},
+    )
+    assert (version.model, version.model_params) == ("local/small-model", {"temperature": 0})
+    assert version.commit_message == "pirate"
+    assert seen == [("GET", "/api/prompt-repo/prompts/p-1", {}, None)]
+    await admin.aclose()
+
+
+async def test_prompts_list_by_folder_and_a_prompt_without_versions_has_none() -> None:
+    seen, handler = answering(
+        {("GET", "/api/prompt-repo/prompts"): {"prompts": [PROMPT, BARE_PROMPT]}}
+    )
+    admin = client(handler)
+    pirate, bare = await admin.prompts.list(folder_id="f-1")
+    assert pirate.latest_version is not None
+    assert bare.latest_version is None
+    assert [q for _, _, q, _ in seen] == [{"folder_id": "f-1"}]
+    await admin.prompts.list()
+    assert seen[-1][2] == {}
+    await admin.aclose()
+
+
+async def test_a_prompt_is_found_by_name_once_or_not_at_all() -> None:
+    twin = BARE_PROMPT | {"id": "p-2", "name": "twin"}
+    _, handler = answering(
+        {("GET", "/api/prompt-repo/prompts"): {"prompts": [PROMPT, twin, twin | {"id": "p-3"}]}}
+    )
+    admin = client(handler)
+    found = await admin.prompts.find("pirate")
+    assert found is not None and found.id == "p-1"
+    assert await admin.prompts.find("parrot") is None
+    with pytest.raises(ValueError, match="2 prompts are named 'twin'"):
+        await admin.prompts.find("twin")
+    await admin.aclose()
+
+
+async def test_committing_sends_the_gateway_version_shape() -> None:
+    """``provider`` and ``model`` are separate fields to the gateway; the SDK takes the
+    ``provider/model`` string every other call takes."""
+    seen, handler = answering(
+        {("POST", "/api/prompt-repo/prompts/p-1/versions"): {"version": VERSION}}
+    )
+    admin = client(handler)
+    system = {"role": "system", "content": "Answer ARRR."}
+    version = await admin.prompts.commit(
+        "p-1", [system], model="local/small-model", model_params={"temperature": 0},
+        message="pirate",
+    )  # fmt: skip
+    assert version.number == 2
+    assert seen[0][3] == {
+        "commit_message": "pirate",
+        "messages": [system],
+        "model_params": {"temperature": 0},
+        "provider": "local",
+        "model": "small-model",
+    }
+    await admin.prompts.commit("p-1", [system], model="router/vendor/model-x")
+    assert seen[1][3] | {"messages": None} == {
+        "commit_message": "",
+        "messages": None,
+        "model_params": {},
+        "provider": "router",
+        "model": "vendor/model-x",
+    }
+    await admin.aclose()
+
+
+@pytest.mark.parametrize("model", ["small-model", "/x", "local/"])
+async def test_a_commit_without_a_provider_is_refused_before_sending(model) -> None:
+    seen, handler = answering({})
+    admin = client(handler)
+    with pytest.raises(ValueError, match="provider/model"):
+        await admin.prompts.commit("p-1", [], model=model)
+    assert seen == []
+    await admin.aclose()
+
+
+async def test_every_other_prompt_route_answers_typed() -> None:
+    seen, handler = answering(
+        {
+            ("POST", "/api/prompt-repo/prompts"): {"prompt": BARE_PROMPT},
+            ("PUT", "/api/prompt-repo/prompts/p-1"): {"prompt": PROMPT | {"name": "corsair"}},
+            ("GET", "/api/prompt-repo/prompts/p-1/versions"): {"versions": [VERSION]},
+            ("GET", "/api/prompt-repo/versions/7"): {"version": VERSION},
+            ("DELETE", "/api/prompt-repo/prompts/p-1"): {"message": "prompt deleted"},
+        }
+    )
+    admin = client(handler)
+    assert (await admin.prompts.create("pirate")).latest_version is None
+    await admin.prompts.create("pirate", folder_id="f-1")
+    assert (await admin.prompts.update("p-1", name="corsair")).name == "corsair"
+    assert [v.number for v in await admin.prompts.versions("p-1")] == [2]
+    assert (await admin.prompts.version(7)).prompt_id == "p-1"
+    assert await admin.prompts.delete("p-1") is None
+    assert [(m, p, b) for m, p, _, b in seen] == [
+        ("POST", "/api/prompt-repo/prompts", {"name": "pirate"}),
+        ("POST", "/api/prompt-repo/prompts", {"name": "pirate", "folder_id": "f-1"}),
+        ("PUT", "/api/prompt-repo/prompts/p-1", {"name": "corsair"}),
+        ("GET", "/api/prompt-repo/prompts/p-1/versions", None),
+        ("GET", "/api/prompt-repo/versions/7", None),
+        ("DELETE", "/api/prompt-repo/prompts/p-1", None),
+    ]
+    await admin.aclose()
+
+
+FILE = {
+    "id": "f-1",
+    "skill_version_id": "sv-1",
+    "path": "references/rules.md",
+    "source_type": "text",
+    "blob_id": "b-1",
+    "mime_type": "text/markdown",
+    "file_size_bytes": 14,
+    "created_at": "2026-10-05T19:26:42.054379827Z",
+    "updated_at": "2026-10-05T19:26:42.054549981Z",
+    "blob": {"id": "b-1", "created_at": "2026-10-05T19:26:42.054478847Z"},
+}
+SKILL = {
+    "id": "s-1",
+    "name": "sql-review",
+    "description": "Reviews SQL.",
+    "skill_md_body": "# SQL review\nRead references/rules.md first.",
+    "latest_version": "1.0.0",
+    "created_at": "2026-10-05T19:26:42.054081635Z",
+    "updated_at": "2026-10-05T19:26:42.054081635Z",
+    "files": [FILE],
+    "file_count": 1,
+    "highest_version": "1.1.0",
+}
+#: A skill as the listing has it: no body, no files.
+LISTED_SKILL = {k: v for k, v in SKILL.items() if k not in ("files", "highest_version")} | {
+    "skill_md_body": ""
+}
+
+
+async def test_a_skill_reads_typed_with_its_body_and_files() -> None:
+    seen, handler = answering({("GET", "/api/skills/s-1"): {"skill": SKILL}})
+    admin = client(handler)
+    skill = await admin.skills.get("s-1")
+    assert (skill.id, skill.name, skill.version, skill.highest_version) == (
+        "s-1",
+        "sql-review",
+        "1.0.0",
+        "1.1.0",
+    )
+    assert skill.body.startswith("# SQL review")
+    [file] = skill.files
+    assert (file.path, file.source_type, file.mime_type, file.size, file.source_url) == (
+        "references/rules.md",
+        "text",
+        "text/markdown",
+        14,
+        None,
+    )
+    assert (skill.license, skill.metadata, skill.extra_frontmatter) == (None, {}, {})
+    await admin.skills.get("s-1", version="1.1.0")
+    assert [q for _, _, q, _ in seen] == [{}, {"version": "1.1.0"}]
+    await admin.aclose()
+
+
+async def test_skills_are_listed_across_every_page() -> None:
+    """The gateway pages at 50 by default and at most 100."""
+
+    def page(request):
+        offset = int(request.url.params["offset"])
+        names = range(offset, min(offset + 100, 101))
+        return {"skills": [LISTED_SKILL | {"id": f"s-{n}", "name": f"k{n}"} for n in names]}
+
+    seen, handler = answering({("GET", "/api/skills"): page})
+    admin = client(handler)
+    skills = await admin.skills.list(search="k")
+    assert len(skills) == 101
+    assert (skills[0].body, skills[0].files) == ("", ())
+    assert [q for _, _, q, _ in seen] == [
+        {"search": "k", "limit": "100", "offset": "0"},
+        {"search": "k", "limit": "100", "offset": "100"},
+    ]
+    await admin.aclose()
+
+
+async def test_a_skill_is_found_by_its_exact_name_then_read_in_full() -> None:
+    """The id route answers 404 for a name; the listing's search also matches descriptions
+    and substrings, so only an exact name counts."""
+    near = LISTED_SKILL | {"id": "s-9", "name": "sql-review-legacy"}
+    seen, handler = answering(
+        {
+            ("GET", "/api/skills"): {"skills": [near, LISTED_SKILL]},
+            ("GET", "/api/skills/s-1"): {"skill": SKILL},
+        }
+    )
+    admin = client(handler)
+    found = await admin.skills.find("sql-review", version="1.0.0")
+    assert found is not None and found.files
+    assert seen[-1][1:3] == ("/api/skills/s-1", {"version": "1.0.0"})
+    assert await admin.skills.find("sql") is None
+    await admin.aclose()
+
+
+async def test_publishing_sends_the_whole_version_with_inline_text_files() -> None:
+    seen, handler = answering(
+        {
+            ("POST", "/api/skills"): {"skill": SKILL},
+            ("PUT", "/api/skills/s-1"): {"skill": SKILL},
+        }
+    )
+    admin = client(handler)
+    files = {"references/rules.md": "1. No SELECT *", "NOTES": "keep"}
+    await admin.skills.create(
+        "sql-review", description="Reviews SQL.", body="# SQL", version="1.0.0", files=files,
+        license="MIT",
+    )  # fmt: skip
+    await admin.skills.publish(
+        "s-1", description="Reviews SQL.", body="# SQL v2", version="1.1.0", serve=False
+    )
+    created, published = (body for _, _, _, body in seen)
+    assert created == {
+        "name": "sql-review",
+        "description": "Reviews SQL.",
+        "skill_md_body": "# SQL",
+        "version": "1.0.0",
+        "files": [
+            {"path": "references/rules.md", "source_type": "text",
+             "content": "1. No SELECT *", "mime_type": "text/markdown"},
+            {"path": "NOTES", "source_type": "text", "content": "keep",
+             "mime_type": "text/plain"},
+        ],
+        "license": "MIT",
+    }  # fmt: skip
+    assert published == {
+        "description": "Reviews SQL.",
+        "skill_md_body": "# SQL v2",
+        "version": "1.1.0",
+        "files": [],
+        "serve": False,
+    }
+    await admin.aclose()
+
+
+async def test_skill_versions_shift_and_delete() -> None:
+    """Serving is decoupled from publishing: rollback points at an existing version."""
+    versions = [
+        {"id": "sv-2", "skill_id": "s-1", "version": "1.1.0",
+         "created_at": "2026-10-05T19:26:42.065033196Z"},
+        {"id": "sv-1", "skill_id": "s-1", "version": "1.0.0", "created_by": "ops"},
+    ]  # fmt: skip
+    seen, handler = answering(
+        {
+            ("GET", "/api/skills/s-1/versions"): {"versions": versions, "total": 2},
+            ("POST", "/api/skills/s-1/shift-version"): {"skill": SKILL},
+            ("DELETE", "/api/skills/s-1"): {"message": "skill deleted successfully"},
+        }
+    )
+    admin = client(handler)
+    newest, oldest = await admin.skills.versions("s-1")
+    assert (newest.version, newest.created_by, oldest.created_by) == ("1.1.0", None, "ops")
+    assert (await admin.skills.shift_version("s-1", "1.0.0")).version == "1.0.0"
+    await admin.skills.delete("s-1")
+    assert [(m, p, b) for m, p, _, b in seen[1:]] == [
+        ("POST", "/api/skills/s-1/shift-version", {"version": "1.0.0"}),
+        ("DELETE", "/api/skills/s-1", None),
+    ]
+    await admin.aclose()
+
+
+async def test_a_skill_file_is_read_as_bytes_from_the_serving_route() -> None:
+    seen: list[str] = []
+
+    def handler(request):
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, content=b"1. No SELECT *", headers={"Content-Type": "text/x"})
+
+    admin = client(handler)
+    assert await admin.skills.read_file("sql review", "references/a b.md") == b"1. No SELECT *"
+    assert seen == ["/api/skills/serve/sql%20review/files/references/a%20b.md"]
+    await admin.aclose()
+
+
+async def test_a_missing_skill_file_is_not_found() -> None:
+    admin = client(lambda r: httpx.Response(404, json={"error": {"message": "file not found"}}))
+    with pytest.raises(NotFoundError):
+        await admin.skills.read_file("sql-review", "nope.md")
+    await admin.aclose()
+
+
+VMCP = {
+    "id": 3,
+    "name": "Finance Tools",
+    "endpoint_slug": "finance-tools",
+    "enabled": True,
+    "tools": [{"mcp_client_id": "c-erp", "tool_names": ["get_stock"]},
+              {"mcp_client_id": "c-crm", "tool_names": ["*"]}],
+    "virtual_key_ids": ["vk-1"],
+    "created_at": "2026-10-05T19:23:11Z",
+    "updated_at": "2026-10-05T19:23:11Z",
+}  # fmt: skip
+
+
+async def test_a_virtual_mcp_reads_typed() -> None:
+    _, handler = answering({("GET", "/api/mcp/virtual-mcps/3"): {"virtual_mcp": VMCP}})
+    admin = client(handler)
+    vmcp = await admin.virtual_mcps.get(3)
+    assert (vmcp.id, vmcp.slug, vmcp.enabled, vmcp.description) == (
+        3,
+        "finance-tools",
+        True,
+        None,
+    )
+    assert vmcp.tools == {"c-erp": ("get_stock",), "c-crm": ("*",)}
+    assert vmcp.virtual_key_ids == ("vk-1",)
+    await admin.aclose()
+
+
+async def test_creating_a_virtual_mcp_sends_tool_specs_by_client_id() -> None:
+    created = VMCP | {"virtual_key_ids": []}
+    seen, handler = answering({("POST", "/api/mcp/virtual-mcps"): {"virtual_mcp": created}})
+    admin = client(handler)
+    tools = {"c-erp": ["get_stock"], "c-crm": ("*",)}
+    await admin.virtual_mcps.create("Finance Tools", tools)
+    await admin.virtual_mcps.create(
+        "Finance Tools", tools, slug="fin", description="ERP reads", enabled=False
+    )
+    specs = [
+        {"mcp_client_id": "c-erp", "tool_names": ["get_stock"]},
+        {"mcp_client_id": "c-crm", "tool_names": ["*"]},
+    ]
+    assert [body for _, _, _, body in seen] == [
+        {"name": "Finance Tools", "tools": specs, "enabled": True},
+        {"name": "Finance Tools", "tools": specs, "enabled": False,
+         "endpoint_slug": "fin", "description": "ERP reads"},
+    ]  # fmt: skip
+    await admin.aclose()
+
+
+async def test_updating_a_virtual_mcp_sends_only_what_changes() -> None:
+    """The gateway keeps every field the body leaves out (and ignores a slug)."""
+    seen, handler = answering({("PUT", "/api/mcp/virtual-mcps/3"): {"virtual_mcp": VMCP}})
+    admin = client(handler)
+    await admin.virtual_mcps.update(3, enabled=False)
+    await admin.virtual_mcps.update(3, name="Fin", description="d", tools={"c-erp": []})
+    emptied = [{"mcp_client_id": "c-erp", "tool_names": []}]
+    assert [body for _, _, _, body in seen] == [
+        {"enabled": False},
+        {"name": "Fin", "description": "d", "tools": emptied},
+    ]
+    await admin.aclose()
+
+
+async def test_virtual_mcps_list_attach_detach_and_delete() -> None:
+    seen, handler = answering(
+        {
+            ("GET", "/api/mcp/virtual-mcps"): {"virtual_mcps": [VMCP], "count": 1},
+            ("POST", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2"): {"success": True},
+            ("DELETE", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2"): {"success": True},
+            ("DELETE", "/api/mcp/virtual-mcps/3"): {"success": True},
+        }
+    )
+    admin = client(handler)
+    assert [v.slug for v in await admin.virtual_mcps.list(search="fin")] == ["finance-tools"]
+    await admin.virtual_mcps.list()
+    assert await admin.virtual_mcps.attach(3, "vk-2") is None
+    await admin.virtual_mcps.detach(3, "vk-2")
+    await admin.virtual_mcps.delete(3)
+    assert [(m, p, q) for m, p, q, _ in seen] == [
+        ("GET", "/api/mcp/virtual-mcps", {"search": "fin", "limit": "100", "offset": "0"}),
+        ("GET", "/api/mcp/virtual-mcps", {"limit": "100", "offset": "0"}),
+        ("POST", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2", {}),
+        ("DELETE", "/api/mcp/virtual-mcps/3/virtual-keys/vk-2", {}),
+        ("DELETE", "/api/mcp/virtual-mcps/3", {}),
+    ]
+    await admin.aclose()

@@ -25,6 +25,7 @@ import re
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -50,7 +51,7 @@ from bifrost_sdk._mcp import (
     server_files,
 )
 from bifrost_sdk._retry import MAX_WAIT, RETRYABLE, Jitter, backoff
-from bifrost_sdk.headers import Options
+from bifrost_sdk.headers import MCP_CLIENTS, MCP_TOOLS, Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
@@ -65,19 +66,43 @@ CODE_MODE_READS = 4
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 
+#: On every completion: the MCP scope headers present and empty, the gateway's deny-all.
+#: Without them a completion under a key with MCP access has the key's tools added to the
+#: request — the model is offered tools the caller never declared (measured: "say hi" cost
+#: 272 prompt tokens with one two-tool server granted, 32 under deny-all) — and the gateway's
+#: agent loop runs, itself, any tool call naming a tool in a client's
+#: ``tools_to_auto_execute``: a call no caller-side governance or record sees. Under deny-all
+#: nothing is added and that execution is refused (logged as an error, never run). The loop
+#: itself is not switched off by any header: with such a client, the refusal is fed back to
+#: the model and the reply that returns is its answer to that. Keep ``tools_to_auto_execute``
+#: empty (:class:`MCPClientConfig` does).
+NO_GATEWAY_TOOLS = {MCP_CLIENTS: "", MCP_TOOLS: ""}
+
 
 def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
     turns = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
     return [{"role": "system", "content": system}, *turns] if system else turns
 
 
+def _completion_headers(options: Options | None) -> dict[str, str]:
+    """A completion's ``x-bf-*`` headers: ``options``, and never the gateway's MCP tools."""
+    if options is not None and (options.mcp_clients or options.mcp_tools):
+        raise ValueError(
+            "a completion never carries the gateway's MCP tools: mcp_clients/mcp_tools scope "
+            "execute_tool(); pass the tools to offer as tools="
+        )
+    return (options.headers() if options is not None else {}) | NO_GATEWAY_TOOLS
+
+
 class Bifrost:
     """One gateway, one default model, three verbs.
 
     Every verb takes ``options=`` (:class:`~bifrost_sdk.headers.Options`) for per-request
-    gateway behaviour. Everything below the public methods exists because a real gateway did
-    it to us: rate limits that carry their delay in the body, reasoning models that answer
-    with nothing, and a circuit breaker that must not confuse "slow down" with "broken".
+    gateway behaviour, and never lets the gateway add or run MCP tools
+    (:data:`NO_GATEWAY_TOOLS`): a model is offered the tools passed as ``tools=``, no others.
+    Everything below the public methods exists because a real gateway did it to us: rate
+    limits that carry their delay in the body, reasoning models that answer with nothing,
+    and a circuit breaker that must not confuse "slow down" with "broken".
     """
 
     def __init__(
@@ -221,7 +246,7 @@ class Bifrost:
             tools=tools,
             extra=extra,
         ) | {"stream": True}
-        headers = options.headers() if options is not None else None
+        headers = _completion_headers(options)
         self._breaker.check()
         try:
             async with self._client.stream(
@@ -289,10 +314,18 @@ class Bifrost:
     # ----------------------------------------------------------------- MCP tools
 
     async def tools(
-        self, clients: Iterable[str] | None = None, only: Iterable[str] | None = None
+        self,
+        clients: Iterable[str] | None = None,
+        only: Iterable[str] | None = None,
+        *,
+        slug: str | None = None,
     ) -> list[ToolDef]:
         """The MCP tools a request scoped this way could execute, as the gateway lists them
         for this client's virtual key.
+
+        ``slug`` lists one Virtual MCP (``admin.virtual_mcps``) or one MCP client's own
+        endpoint, ``/mcp/<slug>``, instead of everything the key reaches (a slug the key is
+        not attached to is a :class:`PermissionDeniedError`).
 
         ``clients`` and ``only`` mean what ``Options(mcp_clients=, mcp_tools=)`` mean on a
         request: ``None`` is unscoped, an empty sequence is nothing; tools are named
@@ -304,20 +337,20 @@ class Bifrost:
         ``code_mode``, with signature-derived ``parameters`` and no ``annotations``.
         """
         admits = scope(clients, only)
-        return [tool for tool in await self._listed_tools() if admits(tool)]
+        return [tool for tool in await self._listed_tools(_endpoint(slug)) if admits(tool)]
 
-    async def _listed_tools(self) -> list[ToolDef]:
-        result = await self._rpc("tools/list", {})
+    async def _listed_tools(self, endpoint: str) -> list[ToolDef]:
+        result = await self._rpc("tools/list", {}, endpoint=endpoint)
         listed = [t for t in result.get("tools") or () if isinstance(t, dict) and "name" in t]
         tools = [listed_tool(t) for t in listed if t["name"] not in CODE_MODE_META_TOOLS]
         if any(t["name"] in CODE_MODE_META_TOOLS for t in listed):
-            clients = server_files(await self._meta_text("listToolFiles", {}))
-            texts = await self._declarations(clients)
+            clients = server_files(await self._meta_text("listToolFiles", {}, endpoint))
+            texts = await self._declarations(clients, endpoint)
             for client, text in zip(clients, texts, strict=True):
                 tools.extend(declared_tools(client, text))
         return tools
 
-    async def _declarations(self, clients: list[str]) -> list[str]:
+    async def _declarations(self, clients: list[str], endpoint: str) -> list[str]:
         """Each Code Mode client's ``readToolFile`` text, in ``clients`` order.
 
         Read :data:`CODE_MODE_READS` at a time. Every read is awaited before any failure is
@@ -328,7 +361,8 @@ class Bifrost:
 
         async def read(client: str) -> str:
             async with gate:
-                return await self._meta_text("readToolFile", {"fileName": f"servers/{client}.pyi"})
+                arguments = {"fileName": f"servers/{client}.pyi"}
+                return await self._meta_text("readToolFile", arguments, endpoint)
 
         results = await asyncio.gather(*(read(c) for c in clients), return_exceptions=True)
         for result in results:
@@ -336,20 +370,23 @@ class Bifrost:
                 raise result
         return [str(result) for result in results]
 
-    async def _meta_text(self, name: str, arguments: dict[str, Any]) -> str:
+    async def _meta_text(self, name: str, arguments: dict[str, Any], endpoint: str) -> str:
         """A Code Mode meta-tool's text answer, called through the gateway's MCP endpoint."""
-        result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
+        params = {"name": name, "arguments": arguments}
+        result = await self._rpc("tools/call", params, endpoint=endpoint)
         if result.get("isError"):
             raise GatewayError(f"{name} failed", body=str(result.get("content"))[:300])
-        content = result.get("content") or ()
-        return "\n".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
+        return _text(result)
 
-    async def _rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """One JSON-RPC call to the gateway's MCP endpoint, with the virtual key."""
-        request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        url = origin(str(self._client.base_url)) + MCP_ENDPOINT
+    async def _rpc(
+        self, method: str, params: dict[str, Any], *, endpoint: str, **request: Any
+    ) -> dict[str, Any]:
+        """One JSON-RPC call to one of the gateway's MCP endpoints, with the virtual key.
+        ``request`` is passed to httpx (``headers``, ``timeout``)."""
+        message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        url = origin(str(self._client.base_url)) + endpoint
         try:
-            response = await self._client.post(url, json=request)
+            response = await self._client.post(url, json=message, **request)
         except httpx.TransportError as exc:
             raise unreachable(exc) from exc
         if response.status_code >= ERROR_STATUS:
@@ -394,22 +431,36 @@ class Bifrost:
         *,
         options: Options | None = None,
         timeout: float | None = None,  # noqa: ASYNC109 - httpx transport timeout, see complete()
+        slug: str | None = None,
     ) -> dict[str, Any]:
-        """Run one MCP tool call through the gateway; return the ``{"role": "tool"}`` turn.
+        """Run one MCP tool call through the gateway; return the ``{"role": "tool"}`` turn
+        (``"is_error": True`` when the tool failed).
 
         ``tool_call`` is an entry of a completion's ``tool_calls`` (chat format), its name
-        ``<client>-<tool>`` or a Code Mode meta-tool. ``options`` scopes it like a completion
-        (``mcp_clients``/``mcp_tools``) and correlates it (``parent_request_id``: Code Mode's
-        nested calls are logged under it, see :meth:`mcp_logs`). Not retried and not counted
-        by the breaker: a tool may have side effects, and a refused call is a 400.
+        ``<client>-<tool>`` or a Code Mode meta-tool. ``options`` scopes it
+        (``mcp_clients``/``mcp_tools``), correlates it (``parent_request_id``: Code Mode's
+        nested calls are logged under it, see :meth:`mcp_logs`) and says who it is for: the
+        gateway forwards to the server any ``extra`` header the client's
+        ``allowed_extra_headers`` names, and keys per-user MCP credentials by the virtual key
+        (``mcp_session_id`` only when there is none). ``slug`` runs it through
+        ``/mcp/<slug>`` — a Virtual MCP or one client's endpoint — where only that bundle's
+        tools are permitted. Not retried and not counted by the breaker: a tool may have side
+        effects, and a refused call is a 400 (an error turn through a slug).
         """
-        if not (tool_call.get("function") or {}).get("name"):
+        function = tool_call.get("function") or {}
+        if not function.get("name"):
             raise ValueError("tool_call has no function name")
-        request: dict[str, Any] = {"json": tool_call, "params": {"format": "chat"}}
+        request: dict[str, Any] = {}
         if timeout is not None:
             request["timeout"] = timeout
         if options is not None:
             request["headers"] = options.headers()
+        if slug is not None:
+            params = {"name": function["name"], "arguments": _arguments(function)}
+            result = await self._rpc("tools/call", params, endpoint=_endpoint(slug), **request)
+            turn = {"role": "tool", "content": _text(result), "tool_call_id": tool_call.get("id")}
+            return turn | ({"is_error": True} if result.get("isError") else {})
+        request |= {"json": tool_call, "params": {"format": "chat"}}
         try:
             response = await self._client.post("/mcp/tool/execute", **request)
         except httpx.TransportError as exc:
@@ -494,11 +545,9 @@ class Bifrost:
     ) -> dict[str, Any]:
         # httpx reads an explicit timeout=None as "wait forever", so the argument is omitted
         # rather than passed through when the caller has no deadline of their own.
-        request: dict[str, Any] = {"json": body}
+        request: dict[str, Any] = {"json": body, "headers": _completion_headers(options)}
         if timeout is not None:
             request["timeout"] = timeout
-        if options is not None and (extra := options.headers()):
-            request["headers"] = extra
         self._breaker.check()
         error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -552,6 +601,30 @@ class Bifrost:
                 ),
             )
         return str(content or "")
+
+
+def _endpoint(slug: str | None) -> str:
+    """The gateway's MCP endpoint: everything the key reaches, or the one ``/mcp/<slug>``."""
+    return MCP_ENDPOINT if slug is None else f"{MCP_ENDPOINT}/{quote(slug, safe='')}"
+
+
+def _arguments(function: dict[str, Any]) -> dict[str, Any]:
+    """A chat tool call's arguments (a JSON object, usually as text) as an object."""
+    arguments = function.get("arguments") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = jsonlib.loads(arguments)
+        except ValueError as exc:
+            raise ValueError("tool_call arguments are not JSON") from exc
+    if not isinstance(arguments, dict):
+        raise ValueError("tool_call arguments are not a JSON object")
+    return arguments
+
+
+def _text(result: dict[str, Any]) -> str:
+    """An MCP ``tools/call`` result's text parts, joined by newlines; other parts dropped."""
+    content = result.get("content") or ()
+    return "\n".join(str(c["text"]) for c in content if isinstance(c, dict) and c.get("text"))
 
 
 def _parse_json(text: str) -> dict[str, Any]:

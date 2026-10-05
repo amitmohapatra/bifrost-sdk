@@ -64,6 +64,9 @@ class MCPClientConfig(_Frozen):
     choice between ``["*"]`` and nothing must be visible at the call site.
     ``tools_to_auto_execute`` is Agent Mode (the gateway runs tools itself); Trellis never
     uses it and always sends it empty unless told otherwise.
+    ``allowed_extra_headers`` are the request headers the gateway forwards to this server
+    when it runs a tool — how a per-user credential (``Options(extra={...})``) reaches a
+    server that authenticates its caller; ``("*",)`` forwards any.
     """
 
     name: str = Field(min_length=1)
@@ -71,6 +74,7 @@ class MCPClientConfig(_Frozen):
     tools_to_execute: tuple[str, ...]
     tools_to_auto_execute: tuple[str, ...] = ()
     is_code_mode_client: bool = False
+    allowed_extra_headers: tuple[str, ...] = ()
 
     @field_validator("name")
     @classmethod
@@ -85,6 +89,7 @@ class MCPClientConfig(_Frozen):
             "is_code_mode_client": self.is_code_mode_client,
             "tools_to_execute": list(self.tools_to_execute),
             "tools_to_auto_execute": list(self.tools_to_auto_execute),
+            "allowed_extra_headers": list(self.allowed_extra_headers),
         }
 
     @classmethod
@@ -98,6 +103,7 @@ class MCPClientConfig(_Frozen):
             tools_to_execute=tuple(config.get("tools_to_execute") or ()),
             tools_to_auto_execute=tuple(config.get("tools_to_auto_execute") or ()),
             is_code_mode_client=bool(config.get("is_code_mode_client")),
+            allowed_extra_headers=tuple(config.get("allowed_extra_headers") or ()),
         )
 
 
@@ -331,14 +337,7 @@ class MCP(Resource):
         """Every registered client, across all pages, with its tools' annotations (an admin
         listing: with admin auth on it needs ``admin_token``; :meth:`Bifrost.tools` is what a
         virtual key may list)."""
-        entries: list[dict[str, Any]] = []
-        while True:
-            page = await self._api.items(
-                "/api/mcp/clients", ("clients",), limit=_PAGE, offset=len(entries)
-            )
-            entries.extend(page)
-            if len(page) < _PAGE:
-                break
+        entries = await self._api.pages("/api/mcp/clients", ("clients",), _PAGE)
         listed = await self._listing() if any(e.get("tools") for e in entries) else {}
         annotations = {name: hints for name, hints in (listed or {}).items() if hints is not None}
         return [MCPClient._from_gateway(entry, annotations) for entry in entries]

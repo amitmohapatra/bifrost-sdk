@@ -73,12 +73,7 @@ class ManagementAPI:
 
     async def request(self, method: str, path: str, *, json: Any = None, params: Any = None) -> Any:
         """One call. Returns parsed JSON, or ``None`` for an empty body."""
-        try:
-            response = await self._http.request(method, path, json=json, params=params)
-        except httpx.TransportError as exc:
-            raise unreachable(exc) from exc
-        if response.status_code >= ERROR_STATUS:
-            raise from_response(response)
+        response = await self._send(method, path, json=json, params=params)
         if not response.content:
             return None
         try:
@@ -88,6 +83,31 @@ class ManagementAPI:
             raise GatewayError(
                 f"{method} {path} returned a non-JSON body", body=response.text[:300]
             ) from exc
+
+    async def content(self, path: str) -> bytes:
+        """A ``GET`` whose body is not JSON (a file download), as bytes."""
+        return (await self._send("GET", path)).content
+
+    async def _send(self, method: str, path: str, **request: Any) -> httpx.Response:
+        try:
+            response = await self._http.request(method, path, **request)
+        except httpx.TransportError as exc:
+            raise unreachable(exc) from exc
+        if response.status_code >= ERROR_STATUS:
+            raise from_response(response)
+        return response
+
+    async def pages(
+        self, path: str, keys: tuple[str, ...], size: int, **params: Any
+    ) -> list[dict[str, Any]]:
+        """Every item of a ``limit``/``offset`` list endpoint, ``size`` (its maximum page) at a
+        time, until a short page."""
+        entries: list[dict[str, Any]] = []
+        while True:
+            page = await self.items(path, keys, limit=size, offset=len(entries), **params)
+            entries.extend(page)
+            if len(page) < size:
+                return entries
 
     async def items(self, path: str, keys: tuple[str, ...], **params: Any) -> list[dict[str, Any]]:
         """A list endpoint's items, unwrapped from the first envelope key present."""

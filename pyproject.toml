@@ -1,6 +1,6 @@
 [project]
 name = "bifrost-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "A small client for a Bifrost LLM gateway."
 requires-python = ">=3.12"
 dependencies = [
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6"]
+dev = ["mcp>=2.2", "pytest>=8", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling"]
@@ -38,6 +38,8 @@ markers = ["live: needs a running gateway (BIFROST_URL, or BIFROST_LIVE_URL); ru
 # PLR0913: the three verbs take many *keyword-only* arguments on purpose — that is the
 # ergonomic shape for a client API, and collapsing them into an options object would make
 # the common call harder to write, not easier.
+# admin/skills.py: a skill version is published as one call with its fields named, the same way.
 "src/bifrost_sdk/_client.py" = ["PLR0913"]
+"src/bifrost_sdk/admin/skills.py" = ["PLR0913"]
 # PLR2004: a test's expected value is a literal on purpose — naming it hides what is asserted.
 "tests/**" = ["PLR2004"]
