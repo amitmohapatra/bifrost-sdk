@@ -22,13 +22,13 @@ flowchart LR
     subgraph sdk["bifrost-sdk"]
         bifrost["Bifrost<br/>chat · json · stream · complete<br/>tools · execute_tool · mcp_logs · ping"]
         mcpres["bf.mcp (MCP)<br/>clients · add · update · remove"]
-        admin["Admin<br/>vk · governance · routing · prompts · skills"]
+        admin["Admin<br/>vk · governance · routing · prompts · skills<br/>virtual_mcps"]
     end
 
     subgraph gw["Bifrost gateway"]
         v1["/v1 inference<br/>/chat/completions · /models<br/>/mcp/tool/execute"]
-        mcpep["/mcp<br/>JSON-RPC tools/list · tools/call"]
-        api["/api management<br/>mcp clients · mcp-logs · governance<br/>routing · prompt-repo · skills"]
+        mcpep["/mcp, /mcp/<slug><br/>JSON-RPC tools/list · tools/call"]
+        api["/api management<br/>mcp clients · virtual-mcps · mcp-logs<br/>governance · routing · prompt-repo · skills"]
         gov["governance<br/>virtual key: models, MCP tools,<br/>budget, rate limit"]
         route["routing rules (CEL)<br/>complexity tier"]
     end
@@ -71,7 +71,7 @@ flowchart TB
     retry["_retry.py<br/>RETRYABLE · MAX_WAIT · retry_after() · backoff() (full jitter)"]
     errors["_errors.py<br/>BifrostError hierarchy · typed status errors · from_response()"]
     breaker["_breaker.py<br/>Breaker · counts()"]
-    adminpkg["admin/<br/>Admin · VirtualKeys · Governance<br/>Routing · Prompts · Skills"]
+    adminpkg["admin/<br/>Admin · VirtualKeys · Governance<br/>Routing · Prompts · Skills · VirtualMCPs"]
 
     init --> client
     init --> mcp
@@ -200,8 +200,11 @@ sequenceDiagram
 ## Listing and calling MCP tools
 
 The gateway lists MCP tools to a virtual key only on its own MCP endpoint; `/api/*` is closed
-to a virtual key when admin auth is on. Outside Agent Mode the gateway never runs a tool by
-itself: the application runs each call, so its policy and approval sit in front.
+to a virtual key when admin auth is on. `/mcp/<slug>` narrows the endpoint to one Virtual MCP
+(or one client's own endpoint); `tools(slug=)` and `execute_tool(slug=)` go there. Every
+completion carries the MCP scope headers empty (deny-all), so the gateway adds no MCP tool to
+it and refuses any its agent loop would run: the application lists the tools, offers them,
+and runs each call, so its policy and approval sit in front.
 
 ```mermaid
 sequenceDiagram
@@ -227,7 +230,7 @@ sequenceDiagram
     SDK-->>App: list[ToolDef]
 
     App->>SDK: complete(messages, tools=[...])
-    SDK->>V1: POST /v1/chat/completions
+    SDK->>V1: POST /v1/chat/completions<br/>x-bf-mcp-include-clients: "" (deny-all), -tools: ""
     V1-->>SDK: choices[0].message.tool_calls
     SDK-->>App: payload
     App->>App: policy / approval for each tool call
@@ -368,3 +371,7 @@ stateDiagram-v2
   client that permits nothing is a decision made at the call site.
 - **Per-request behaviour is headers.** Everything the gateway does for one call is an
   `x-bf-*` header, built from `Options` so a misspelt header cannot be silently ignored.
+- **The caller runs the tools.** A completion never gets the gateway's MCP tools: added tools
+  would reach the model unseen, and the gateway's agent loop would run calls past the
+  caller's governance and records. The MCP scope is for `execute_tool`; on a completion a
+  non-empty one is refused.

@@ -147,8 +147,8 @@ process that serves several callers through one client.
 | get a parsed object (with a JSON schema, or tolerant parsing of prose and code fences) | `bf.json(prompt, schema=...)` | `dict` |
 | show text as it is generated (time-to-first-token matters) | `bf.stream(prompt)` | `AsyncIterator[str]` |
 | build a framework on the gateway: usage, `tool_calls`, `finish_reason`, only the keys you set | `bf.complete(prompt)` | `dict` (the gateway's response) |
-| know which MCP tools this key may run, to offer them to a model | `bf.tools(clients, only)` | `list[ToolDef]` |
-| run a tool call the model asked for, after your own policy check (in Trellis, `trellis.harness.governance`; a wrapped agent's harness does both) | `bf.execute_tool(tool_call)` | `dict` (`{"role": "tool", …}`) |
+| know which MCP tools this key may run, to offer them to a model | `bf.tools(clients, only)`, or one Virtual MCP's: `bf.tools(slug=...)` | `list[ToolDef]` |
+| run a tool call the model asked for, after your own policy check (in Trellis, `trellis.harness.governance`; a wrapped agent's harness does both) | `bf.execute_tool(tool_call)` (`slug=` to run it through one Virtual MCP) | `dict` (`{"role": "tool", …}`) |
 | read back what tools ran (e.g. a Code Mode script's nested calls) | `bf.mcp_logs(since, parent_request_id=...)` | `list[MCPLog]` |
 | check readiness (health probe) | `bf.ping()` | `bool`, never raises |
 | see every registered MCP server and all its tools (admin) | `bf.mcp.clients()` | `list[MCPClient]` |
@@ -156,8 +156,9 @@ process that serves several callers through one client.
 | create, rotate or check a virtual key | `Admin(...).vk.*` | `dict` / `list[dict]` |
 | read budgets, rate limits, teams, customers | `Admin(...).governance.*` | `list[dict]` |
 | route requests by CEL rule or by complexity tier | `Admin(...).routing.*` | `dict` / `list[dict]` |
-| store and version prompts for injection | `Admin(...).prompts.*` + `Options(prompt_id=...)` | `dict` / `list[dict]` |
-| publish and roll back Agent Skills | `Admin(...).skills.*` | `dict` / `list[dict]` |
+| store, version and resolve prompts for injection | `Admin(...).prompts.*` + `Options(prompt_id=...)` | `Prompt` / `PromptVersion` |
+| publish, read (body and files) and roll back Agent Skills | `Admin(...).skills.*` | `Skill` / `SkillVersion` / `bytes` |
+| bundle tools of several MCP servers behind one endpoint for some keys | `Admin(...).virtual_mcps.*` | `VirtualMCP` |
 
 ## The completion verbs
 
@@ -194,16 +195,15 @@ Everything the gateway does for one call is selected by an `x-bf-*` header. Buil
 from bifrost_sdk import Options
 
 opts = Options(
-    prompt_id="p-123",  # inject a stored prompt
+    prompt_id=prompt.id,  # inject a stored prompt (Administration: admin.prompts.find)
     prompt_version=3,
-    mcp_clients=["erp"],  # MCP scope
-    mcp_tools=["erp-get_stock"],
     session_id=thread_id,
     customer_id="acme",
     content_logging=False,  # keep this turn out of the gateway's content logs
     extra={"x-tier": "batch"},  # any other header, e.g. one a routing rule matches on
 )
 text = await bf.chat("what changed?", options=opts)
+turn = await bf.execute_tool(call, options=Options(mcp_tools=["erp-get_stock"]))  # MCP scope
 ```
 
 `Options` is frozen; `opts.merged(session_id=...)` returns a copy. Unset fields send nothing.
@@ -213,8 +213,8 @@ The header names are public constants in `bifrost_sdk.headers`:
 | --- | --- | --- |
 | `virtual_key` | `x-bf-vk` (`VIRTUAL_KEY`) | governance identity for this request |
 | `prompt_id`, `prompt_version` | `x-bf-prompt-id`, `x-bf-prompt-version` (`PROMPT_ID`, `PROMPT_VERSION`) | inject a stored prompt; no id, no version header (a version alone selects nothing); no version, the latest committed one |
-| `mcp_clients`, `mcp_tools` | `x-bf-mcp-include-clients`, `x-bf-mcp-include-tools` (`MCP_CLIENTS`, `MCP_TOOLS`) | MCP scope, comma-joined (below) |
-| `mcp_session_id` | `x-bf-mcp-session-id` (`MCP_SESSION`) | MCP session |
+| `mcp_clients`, `mcp_tools` | `x-bf-mcp-include-clients`, `x-bf-mcp-include-tools` (`MCP_CLIENTS`, `MCP_TOOLS`) | MCP scope of `execute_tool`, comma-joined (below); on a completion, always deny-all |
+| `mcp_session_id` | `x-bf-mcp-session-id` (`MCP_SESSION`) | the caller's identity for per-user MCP credentials when the request has no virtual key (and no signed-in user) |
 | `parent_request_id` | `x-bf-parent-request-id` (`PARENT_REQUEST_ID`) | correlate tool executions (Code Mode's nested calls) |
 | `session_id` | `x-bf-session-id` (`SESSION`) | conversation identity |
 | `cache_key`, `cache_type`, `cache_threshold` | `x-bf-cache-key`, `x-bf-cache-type`, `x-bf-cache-threshold` (`CACHE_*`) | semantic cache control |
@@ -223,15 +223,46 @@ The header names are public constants in `bifrost_sdk.headers`:
 | `dimensions={"team": "payments"}` | `x-bf-dim-team: payments` (`DIMENSION_PREFIX`) | reporting dimensions |
 | `extra` | as given, applied last | anything else |
 
-**MCP scope.** `mcp_clients=None` / `mcp_tools=None` (the default) sends no header: the
-request sees every tool its virtual key allows. An **empty** sequence sends the header empty,
-which the gateway treats as deny-all. Clients are named as registered (or `*`); tools as
-`<client>-<tool>` or `<client>-*` — a bare tool name or a bare `*` matches nothing.
+**MCP scope.** On `execute_tool`, `mcp_clients=None` / `mcp_tools=None` (the default) sends
+no header: the call may use every tool its virtual key allows. An **empty** sequence sends
+the header empty, which the gateway treats as deny-all. Clients are named as registered (or
+`*`); tools as `<client>-<tool>` or `<client>-*` — a bare tool name or a bare `*` matches
+nothing.
+
+**Completions never get the gateway's MCP tools.** `chat`, `json`, `stream` and `complete`
+always send both scope headers empty, and refuse (`ValueError`, nothing sent) an `Options`
+with a non-empty scope. Without them the gateway adds the key's MCP tools to the request — the
+model is offered tools the caller never declared (a two-tool server granted to the key took
+"say hi" from 32 to 272 prompt tokens) — and its agent loop runs, itself, any tool call that
+names a tool in a client's `tools_to_auto_execute`, out of sight of the caller's governance
+and records. Under deny-all nothing is added and that execution is refused (the MCP log shows
+it as an error). No header turns the loop itself off: with such a client, the gateway feeds its
+refusal back to the model and returns the model's answer to that, so keep
+`tools_to_auto_execute` empty (the default). The live suite checks both against the gateway.
+
+**Stored prompts.** `Options(prompt_id=..., prompt_version=...)` has the gateway prepend
+that version's messages to the request's own and apply its `model_params` wherever the
+request set none; without `prompt_version`, the latest committed version. An unknown id or
+version is not an error: the request goes without the template. So resolve a name once with
+`admin.prompts.find(name)` and send its `id` (a `PromptVersion.number` pins the version).
+
+**Per-user MCP credentials.** A header named in a client's `allowed_extra_headers` is
+forwarded by the gateway to that server on every tool call made with it —
+`Options(extra={"x-user-token": token})` on `execute_tool` reaches the server as that user's
+credential (checked live, through `/v1/mcp/tool/execute` and `/mcp/<slug>`). Clients the
+gateway authenticates per user (`per_user_headers`, `per_user_oauth`) key the stored
+credential by the signed-in user, else the virtual key, else `mcp_session_id` (read only when
+there is neither, per the gateway's source) — so under one shared virtual key every caller is
+the same "user", and a credential per person needs a key per person or a forwarded header;
+until that identity has one, the gateway answers that authentication is required, with the URL where it
+is given (an error turn through a slug, an error status through `/v1/mcp/tool/execute`).
 
 ## MCP tools
 
-The gateway injects MCP tools into completions but, outside Agent Mode, does not run them: the
-caller does, so policy, audit and approval can sit in front of each call.
+Through this client the gateway neither adds MCP tools to a completion nor runs them (see
+[Per-request options](#per-request-options)): the caller lists the tools, offers them as
+`tools=`, and runs the calls the model makes, so policy, audit and approval can sit in front
+of each call.
 
 ```python
 tools = await bf.tools(clients=["erp"], only=["erp-*"])  # -> list[ToolDef]
@@ -264,11 +295,19 @@ turn = await bf.execute_tool(tool_call, options=Options(mcp_clients=["erp"]))
   discovered tool, annotations joined from `/mcp` when that listing answers); with admin auth
   on it needs `admin_token`. `MCPClient` carries `id`, `config` (`MCPClientConfig`), `state`,
   `disabled` and `tools`; `MCPClient.executable` is the subset its `tools_to_execute` lets run.
-- `execute_tool(tool_call, *, options=None, timeout=None)` takes an entry of a completion's
-  `tool_calls` (`POST /v1/mcp/tool/execute?format=chat`). It is not retried and does not count
-  toward the circuit breaker: a tool may have side effects, and a refused call (out of scope,
-  not allowed) is a 400 `GatewayError`. A call with no function name raises `ValueError`
-  before anything is sent.
+- `execute_tool(tool_call, *, options=None, timeout=None, slug=None)` takes an entry of a
+  completion's `tool_calls` (`POST /v1/mcp/tool/execute?format=chat`). It is not retried and
+  does not count toward the circuit breaker: a tool may have side effects, and a refused call
+  (out of scope, not allowed) is a 400 `GatewayError`. A failed tool is a turn with
+  `"is_error": True`. A call with no function name raises `ValueError` before anything is
+  sent.
+- **Virtual MCPs.** `slug=` on `tools()` and `execute_tool()` goes through `/mcp/<slug>`: one
+  Virtual MCP (`admin.virtual_mcps`), or one client's own endpoint (its slug is its name by
+  default). The listing is that bundle's tools only, and a call outside it comes back as an
+  error turn; a slug the key is not attached to raises `PermissionDeniedError` (403). Without
+  a slug, a key's attached bundles are part of everything it reaches. `execute_tool` through a
+  slug sends JSON-RPC `tools/call` (its arguments must be a JSON object; `ValueError`
+  otherwise) and answers with the same turn shape.
 - **Code Mode.** For a client with `is_code_mode_client=True`, completions see the gateway's
   meta-tools (`listToolFiles`, `readToolFile`, `getToolDocs`, `executeToolCode`) instead of
   its tools; run them with `execute_tool` like any other. Send
@@ -306,7 +345,8 @@ await bf.mcp.remove(erp.id)
 ```
 
 `add` registers only `http`/`sse` connections with a URL (`ValueError` otherwise). `update`
-changes name, tool allow-lists and the Code Mode flag. The gateway answers 200 to a connection
+changes name, tool allow-lists, the Code Mode flag and `allowed_extra_headers` (the caller
+headers forwarded to the server, see per-user credentials above). The gateway answers 200 to a connection
 change and ignores it, so `update` refuses one: remove the client and add it again.
 `tools_to_auto_execute` (Agent Mode) defaults to empty. The gateway refuses private-network
 MCP targets to unauthenticated callers.
@@ -315,8 +355,8 @@ MCP targets to unauthenticated callers.
 
 ## Administration
 
-Virtual keys, budgets, routing rules, stored prompts and skills are operator tooling, on a
-separate client:
+Virtual keys, budgets, routing rules, stored prompts, skills and Virtual MCPs are operator
+tooling, on a separate client:
 
 ```python
 from bifrost_sdk.admin import Admin
@@ -330,7 +370,9 @@ A virtual key's `provider_configs` and `mcp_configs` are deny-by-default: a key 
 without them permits nothing. Keyword arguments (`**fields`, `**changes`, `**filters`) are
 sent as the body or the query string unchanged, so any field the gateway accepts can be set.
 List methods unwrap the gateway's envelope (`{"virtual_keys": [...]}` and its spellings) and
-return `[]` for an envelope they do not recognise.
+return `[]` for an envelope they do not recognise. The prompt, skill and Virtual MCP methods
+answer typed (frozen pydantic models, exported by `bifrost_sdk.admin`) and read paged lists to
+the end.
 
 | Namespace | Method | Route |
 | --- | --- | --- |
@@ -351,15 +393,52 @@ return `[]` for an envelope they do not recognise.
 | | `delete_rule(rule_id)` | `DELETE /api/routing/rules/{rule_id}` |
 | | `complexity_config()` / `set_complexity_config(**config)` | `GET` / `PUT /api/routing/complexity-analyzer-config` |
 | | `complexity_status()` — the analyzer warms asynchronously | `GET /api/routing/complexity-analyzer-status` |
-| `admin.prompts` | `list(**filters)` / `get(prompt_id)` | `GET /api/prompt-repo/prompts[/{prompt_id}]` |
-| | `create(name, **fields)` / `update(prompt_id, **changes)` / `delete(prompt_id)` | `POST` / `PUT` / `DELETE /api/prompt-repo/prompts[/{prompt_id}]` |
-| | `versions(prompt_id)` / `add_version(prompt_id, **fields)` — only a committed version can be injected | `GET` / `POST /api/prompt-repo/prompts/{prompt_id}/versions` |
-| | `version(version_id)` | `GET /api/prompt-repo/versions/{version_id}` |
+| `admin.prompts` | `list(folder_id=None) -> list[Prompt]` / `get(prompt_id) -> Prompt` | `GET /api/prompt-repo/prompts[/{prompt_id}]` |
+| | `find(name) -> Prompt \| None` — names are not unique: two raise `ValueError` | `GET /api/prompt-repo/prompts` |
+| | `create(name, *, folder_id=None)` / `update(prompt_id, **changes)` / `delete(prompt_id)` | `POST` / `PUT` / `DELETE /api/prompt-repo/prompts[/{prompt_id}]` |
+| | `versions(prompt_id) -> list[PromptVersion]` | `GET /api/prompt-repo/prompts/{prompt_id}/versions` |
+| | `commit(prompt_id, messages, *, model, model_params=None, message="") -> PromptVersion` — `model` is `provider/model`; only a committed version is injected | `POST /api/prompt-repo/prompts/{prompt_id}/versions` |
+| | `version(version_id) -> PromptVersion` — by row id, not number | `GET /api/prompt-repo/versions/{version_id}` |
 | | `folders(**filters)` | `GET /api/prompt-repo/folders` |
-| `admin.skills` | `list(**filters)` / `get(skill_id)` | `GET /api/skills[/{skill_id}]` |
-| | `create(name, **fields)` / `update(skill_id, **changes)` / `delete(skill_id)` | `POST` / `PUT` / `DELETE /api/skills[/{skill_id}]` |
-| | `versions(skill_id)` | `GET /api/skills/{skill_id}/versions` |
-| | `shift_version(skill_id, version)` — serve another published version (rollback) | `POST /api/skills/{skill_id}/shift-version` |
+| `admin.skills` | `list(search=None) -> list[Skill]` — without body or files | `GET /api/skills` |
+| | `get(skill_id, version=None) -> Skill` — the served version, or `version` | `GET /api/skills/{skill_id}` |
+| | `find(name, version=None) -> Skill \| None` | `GET /api/skills`, then `GET /api/skills/{id}` |
+| | `versions(skill_id) -> list[SkillVersion]` — newest first | `GET /api/skills/{skill_id}/versions` |
+| | `read_file(name, path) -> bytes` — of the **served** version only | `GET /api/skills/serve/{name}/files/{path}` |
+| | `create(name, *, description, body, version, files=None, **fields) -> Skill` — publishes and serves 1st version | `POST /api/skills` |
+| | `publish(skill_id, *, description, body, version, files=None, serve=True, **fields) -> Skill` — a whole new version | `PUT /api/skills/{skill_id}` |
+| | `shift_version(skill_id, version) -> Skill` — serve another published version (rollback) | `POST /api/skills/{skill_id}/shift-version` |
+| | `delete(skill_id)` | `DELETE /api/skills/{skill_id}` |
+| `admin.virtual_mcps` | `list(search=None) -> list[VirtualMCP]` / `get(vmcp_id) -> VirtualMCP` | `GET /api/mcp/virtual-mcps[/{id}]` |
+| | `create(name, tools, *, slug=None, description=None, enabled=True)` / `update(vmcp_id, *, name=, tools=, description=, enabled=)` / `delete(vmcp_id)` | `POST` / `PUT` / `DELETE /api/mcp/virtual-mcps[/{id}]` |
+| | `attach(vmcp_id, vk_id)` / `detach(vmcp_id, vk_id)` | `POST` / `DELETE /api/mcp/virtual-mcps/{id}/virtual-keys/{vk_id}` |
+
+**Prompts.** A `PromptVersion` carries `number` (what `Options(prompt_version=)` selects),
+`messages` (the chat messages prepended, in order), `model` (`provider/model`),
+`model_params`, `commit_message`, `is_latest`; `Prompt.latest_version` is `None` until one is
+committed.
+
+```python
+prompt = await admin.prompts.create("triage")
+v1 = await admin.prompts.commit(
+    prompt.id, [{"role": "system", "content": "You triage tickets."}], model=MODEL
+)  # MODEL: "provider/model"
+reply = await bf.chat(ticket, options=Options(prompt_id=prompt.id, prompt_version=v1.number))
+```
+
+**Skills.** A `Skill` is one version of it: `version`, `body` (the `SKILL.md` body),
+`files` (`SkillFile`: `path`, `source_type`, `mime_type`, `size`), `highest_version` and the
+frontmatter fields. `files=` on `create`/`publish` maps a path to its text, stored inline with
+a MIME type from the extension. `/api/skills/{id}` takes ids only, hence `find(name)`. A
+file's bytes are not in any JSON answer: `read_file` reads them from the gateway's public
+serving route, which serves the served version — a file of an unserved version cannot be read
+back. Versions only go up, and reusing one is a 409 `ConflictError`.
+
+**Virtual MCPs.** `tools` maps an MCP client **id** (`MCPClient.id`) to tool names (`["*"]`:
+all, now and later; `[]`: none). The gateway also accepts a client *name* on save, and then
+serves nothing for it. The slug is derived from the name unless given, unique across Virtual
+MCPs and MCP clients (409), and permanent. A `VirtualMCP` carries `slug`, `tools`, `enabled`,
+`description` and `virtual_key_ids`; it is reachable through no key until `attach`.
 
 Management calls are not retried (most are writes) and do not use the circuit breaker. An
 empty body (`204`) returns `None`; a `200` that is not JSON (the gateway's UI answers unknown
@@ -494,6 +573,21 @@ is unset or the gateway is unreachable. `BIFROST_URL` is the name every reposito
 platform uses for the gateway; the older `BIFROST_LIVE_URL` is still read when it is unset.
 A plain `uv run pytest` deselects them (`addopts` in `pyproject.toml`), because `BIFROST_URL`
 is often set in a shell that did not mean to register clients on that gateway.
+
+The live tests of prompts, skills, Virtual MCPs, per-user headers and the no-gateway-tools
+guarantee create and delete their own prompts, skills, Virtual MCPs and virtual keys. The
+ones that complete need `BIFROST_LIVE_MODEL` (`provider/model`, any model the gateway
+serves). The ones that run tools use `tests/local_mcp.py`, a small MCP server (streamable
+HTTP, on `127.0.0.1:8097`) that the tests start themselves. The gateway refuses to register a
+loopback server over an open management API, so it is declared in the gateway's
+`config.json` once, and the tests skip when it is not:
+
+```json
+"mcp": {"client_configs": [{
+  "name": "sdklocal", "connection_type": "http", "connection_string": "http://127.0.0.1:8097/mcp",
+  "auth_type": "none", "tools_to_execute": ["*"], "allowed_extra_headers": ["x-user-token"]
+}]}
+```
 
 CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check` and the unit tests on
 every pull request and on pushes to `main`.

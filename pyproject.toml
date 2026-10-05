@@ -1,6 +1,6 @@
 [project]
 name = "bifrost-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "A small client for a Bifrost LLM gateway."
 requires-python = ">=3.12"
 dependencies = [

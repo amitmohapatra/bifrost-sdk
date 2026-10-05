@@ -442,10 +442,10 @@ class Bifrost:
         nested calls are logged under it, see :meth:`mcp_logs`) and says who it is for: the
         gateway forwards to the server any ``extra`` header the client's
         ``allowed_extra_headers`` names, and keys per-user MCP credentials by the virtual key
-        or ``mcp_session_id``. ``slug`` runs it through ``/mcp/<slug>`` — a Virtual MCP or one
-        client's endpoint — where only that bundle's tools are permitted. Not retried and not
-        counted by the breaker: a tool may have side effects, and a refused call is a 400 (an
-        error turn through a slug).
+        (``mcp_session_id`` only when there is none). ``slug`` runs it through
+        ``/mcp/<slug>`` — a Virtual MCP or one client's endpoint — where only that bundle's
+        tools are permitted. Not retried and not counted by the breaker: a tool may have side
+        effects, and a refused call is a 400 (an error turn through a slug).
         """
         function = tool_call.get("function") or {}
         if not function.get("name"):
