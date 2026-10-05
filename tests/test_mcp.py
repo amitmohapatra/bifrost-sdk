@@ -22,6 +22,7 @@ from bifrost_sdk import (
     MCPConnection,
     MCPLog,
     Options,
+    PermissionDeniedError,
     RateLimited,
     ServerError,
     ToolAnnotations,
@@ -126,6 +127,17 @@ async def test_clients_are_parsed_into_typed_models() -> None:
     await bf.aclose()
 
 
+async def test_a_clients_forwarded_headers_are_read_back() -> None:
+    """``allowed_extra_headers``: what the gateway forwards from a caller to the server."""
+    listed = entry("erp", ["get_stock"])
+    listed["config"]["allowed_extra_headers"] = ["x-user-token"]
+    _, handler = listing(listed)
+    bf = client(handler)
+    [erp] = await bf.mcp.clients()
+    assert erp.config.allowed_extra_headers == ("x-user-token",)
+    await bf.aclose()
+
+
 async def test_clients_are_read_across_every_page() -> None:
     """The gateway pages at 25 by default and at most 100."""
     offsets: list[str] = []
@@ -168,10 +180,11 @@ async def test_annotations_come_from_the_gateway_mcp_listing() -> None:
     await bf.aclose()
 
 
-def gateway_mcp(tools: list[dict], files: dict[str, str] | None = None):
-    """The gateway's ``POST /mcp`` for one virtual key: ``tools/list`` answers ``tools`` (with
-    the meta-tools when ``files`` names Code Mode clients), ``listToolFiles`` and
-    ``readToolFile`` answer from ``files`` (``<client>`` -> its declarations)."""
+def gateway_mcp(tools: list[dict], files: dict[str, str] | None = None, path: str = "/mcp"):
+    """The gateway's ``POST /mcp`` (or ``path``, a ``/mcp/<slug>``) for one virtual key:
+    ``tools/list`` answers ``tools`` (with the meta-tools when ``files`` names Code Mode
+    clients), ``listToolFiles`` and ``readToolFile`` answer from ``files`` (``<client>`` -> its
+    declarations)."""
     requests: list[httpx.Request] = []
     meta = [{"name": n, "annotations": {}} for n in ("executeToolCode", "listToolFiles")]
 
@@ -181,7 +194,7 @@ def gateway_mcp(tools: list[dict], files: dict[str, str] | None = None):
 
     def handler(request):
         requests.append(request)
-        if request.url.path != "/mcp":
+        if request.url.path != path:
             return httpx.Response(401, text="Unauthorized")
         body = jsonlib.loads(request.content)
         if body["method"] == "tools/list":
@@ -303,6 +316,30 @@ async def test_code_mode_clients_are_read_from_the_meta_tools_declarations() -> 
     await bf.aclose()
 
 
+async def test_a_slug_lists_one_virtual_mcp_code_mode_declarations_included() -> None:
+    """``/mcp/<slug>`` serves one Virtual MCP; every call of the listing goes there."""
+    requests, handler = gateway_mcp(
+        [{"name": "erp-get_stock", "annotations": {}}],
+        files={"docs": DECLARATIONS},
+        path="/mcp/finance-tools",
+    )
+    bf = client(handler)
+    assert names(await bf.tools(slug="finance-tools")) == [
+        "erp-get_stock",
+        "docs-search",
+        "docs-fetch",
+    ]
+    assert {r.url.path for r in requests} == {"/mcp/finance-tools"}
+    await bf.aclose()
+
+
+async def test_a_slug_the_key_is_not_attached_to_is_permission_denied() -> None:
+    bf = client(lambda r: httpx.Response(403, json={"error": {"message": "access_denied"}}))
+    with pytest.raises(PermissionDeniedError):
+        await bf.tools(slug="finance-tools")
+    await bf.aclose()
+
+
 async def test_no_annotation_lookup_without_tools() -> None:
     requests, handler = listing(entry("empty", []))
     bf = client(handler)
@@ -360,6 +397,7 @@ async def test_adding_a_client_posts_the_gateway_shape() -> None:
                 "is_code_mode_client": False,
                 "tools_to_execute": ["get_stock", "create_po"],
                 "tools_to_auto_execute": [],
+                "allowed_extra_headers": [],
             },
         )
     ]
@@ -383,7 +421,13 @@ def current(config: MCPClientConfig = ERP) -> MCPClient:
 async def test_updating_sends_only_the_mutable_fields() -> None:
     seen, handler = recorder()
     bf = client(handler)
-    desired = ERP.model_copy(update={"is_code_mode_client": True, "tools_to_execute": ("*",)})
+    desired = ERP.model_copy(
+        update={
+            "is_code_mode_client": True,
+            "tools_to_execute": ("*",),
+            "allowed_extra_headers": ("x-user-token",),
+        }
+    )
     await bf.mcp.update(current(), desired)
     assert seen == [
         (
@@ -394,6 +438,7 @@ async def test_updating_sends_only_the_mutable_fields() -> None:
                 "is_code_mode_client": True,
                 "tools_to_execute": ["*"],
                 "tools_to_auto_execute": [],
+                "allowed_extra_headers": ["x-user-token"],
             },
         )
     ]
@@ -528,6 +573,84 @@ async def test_a_non_json_tool_result_is_a_gateway_error() -> None:
     bf = client(lambda r: httpx.Response(200, text="<html>"))
     with pytest.raises(GatewayError, match="non-JSON"):
         await bf.execute_tool({"function": {"name": "erp-answer", "arguments": "{}"}})
+    await bf.aclose()
+
+
+def rpc_result(result: dict) -> httpx.Response:
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+
+
+async def test_execute_through_a_slug_is_a_json_rpc_call_answered_as_a_turn() -> None:
+    """Through ``/mcp/<slug>`` only that bundle's tools are permitted; the answer has the
+    shape ``/v1/mcp/tool/execute`` gives, and carries the caller's identity headers."""
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        return rpc_result({"content": [{"type": "text", "text": "7"}, {"type": "image"}]})
+
+    bf = client(handler)
+    call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "erp-get_stock", "arguments": '{"sku": "A1"}'},
+    }
+    options = Options(mcp_session_id="user-9", extra={"x-user-token": "alice"})
+    turn = await bf.execute_tool(call, options=options, timeout=3.0, slug="finance-tools")
+    assert turn == {"role": "tool", "content": "7", "tool_call_id": "call_1"}
+    [request] = seen
+    assert request.url.path == "/mcp/finance-tools"
+    assert jsonlib.loads(request.content) == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "erp-get_stock", "arguments": {"sku": "A1"}},
+    }
+    assert request.headers["x-bf-mcp-session-id"] == "user-9"
+    assert request.headers["x-user-token"] == "alice"
+    assert request.extensions["timeout"]["read"] == 3.0
+    await bf.aclose()
+
+
+async def test_a_failed_tool_through_a_slug_is_an_error_turn() -> None:
+    """The gateway refuses a tool outside the bundle in the result, not with a status."""
+    refused = {"content": [{"type": "text", "text": "not permitted"}], "isError": True}
+    bf = client(lambda r: rpc_result(refused))
+    call = {"id": "c", "function": {"name": "erp-create_po", "arguments": {"sku": "A1"}}}
+    turn = await bf.execute_tool(call, slug="finance-tools")
+    assert turn == {
+        "role": "tool",
+        "content": "not permitted",
+        "tool_call_id": "c",
+        "is_error": True,
+    }
+    await bf.aclose()
+
+
+async def test_a_slug_call_without_arguments_sends_an_empty_object() -> None:
+    seen: list[dict] = []
+
+    def handler(request):
+        seen.append(jsonlib.loads(request.content)["params"])
+        return rpc_result({"content": []})
+
+    bf = client(handler)
+    await bf.execute_tool({"function": {"name": "erp-ping"}}, slug="s")
+    await bf.execute_tool({"function": {"name": "erp-ping", "arguments": ""}}, slug="s")
+    assert seen == [{"name": "erp-ping", "arguments": {}}] * 2
+    await bf.aclose()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"), [("{not json", "not JSON"), ("[1, 2]", "not a JSON object")]
+)
+async def test_unusable_arguments_are_refused_before_a_slug_call(arguments, message) -> None:
+    sent: list[httpx.Request] = []
+    bf = client(lambda r: (sent.append(r), rpc_result({}))[1])
+    call = {"function": {"name": "erp-ping", "arguments": arguments}}
+    with pytest.raises(ValueError, match=message):
+        await bf.execute_tool(call, slug="s")
+    assert sent == []
     await bf.aclose()
 
 
