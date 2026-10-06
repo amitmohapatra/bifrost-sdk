@@ -1,8 +1,37 @@
 # Architecture
 
 How `bifrost-sdk` sits between the agent platform's services and a Bifrost gateway, what is
-inside it, and the two flows that matter most: a chat completion under a virtual key, and
-listing and running MCP tools. Method-level reference is in the [README](../README.md).
+inside it, and its key flows as sequence diagrams: a completion under a virtual key (and under
+the deny-all MCP scope), a stream, listing and running MCP tools, a Virtual MCP with a
+forwarded caller header, and stored prompts and skills. It is also the one home of the error
+vocabulary, the retry policy and the circuit breaker. Method-level reference is in
+[api.md](api.md); the decisions behind the design are the [ADRs](adr/README.md).
+
+Contents: [among the five Trellis repos](#among-the-five-trellis-repos) ·
+[where it sits](#where-it-sits) · [inside the package](#inside-the-package) ·
+[a chat completion](#a-chat-completion-with-a-virtual-key) ·
+[the deny-all MCP scope](#a-completion-never-gets-the-gateways-mcp-tools) ·
+[MCP tools](#listing-and-calling-mcp-tools) ·
+[Virtual MCPs and forwarded headers](#a-virtual-mcp-and-a-forwarded-caller-header) ·
+[prompts and skills](#stored-prompts-and-skills) · [errors](#errors) ·
+[retry policy](#retry-policy) · [circuit breaker](#the-circuit-breaker) ·
+[design decisions](#design-decisions)
+
+## Among the five Trellis repos
+
+Trellis is five repos. This one is the platform's only way to a model or a gateway MCP tool:
+
+| Repo | What it is | Relation to bifrost-sdk |
+|---|---|---|
+| [agent-harness](https://github.com/amitmohapatra/agent-harness) | runs your agent (any framework) with memory, runs, governance, tools and evals | imports it (`bifrost-sdk>=0.3`) for MCP tools, tool execution, MCP logs and completions |
+| [agent-memory-service](https://github.com/amitmohapatra/agent-memory-service) | memory, context and feedback for agents | imports a vendored copy (`bifrost-sdk>=0.2`) for its own model calls |
+| [agent-runs](https://github.com/amitmohapatra/agent-runs) | durable runs, the inbox, schedules, workers, webhooks | none: runs make no model calls |
+| [agent-contracts](https://github.com/amitmohapatra/agent-contracts) | the shared records and ports | none either way; its `classify()` maps this SDK's exceptions by class name, and `AgentError.of` keeps their `retryable` |
+| **bifrost-sdk** (this repo) | the client for the Bifrost model and MCP gateway | — |
+
+The SDK reads no environment variable. The repos that use it read `BIFROST_URL` (the
+gateway's `/v1` URL) and `BIFROST_VIRTUAL_KEY` themselves and pass them to the constructor
+([configuration.md](configuration.md#the-names-the-other-repos-use)).
 
 ## Where it sits
 
@@ -33,7 +62,7 @@ flowchart LR
         route["routing rules (CEL)<br/>complexity tier"]
     end
 
-    providers["LLM providers<br/>OpenAI · Anthropic · Gemini · local"]
+    providers["LLM providers<br/>(any the gateway serves)"]
     servers["MCP servers<br/>(http / sse)"]
 
     harness --> bifrost
@@ -197,6 +226,46 @@ sequenceDiagram
     end
 ```
 
+## A completion never gets the gateway's MCP tools
+
+A virtual key with MCP access would, by default, have the gateway add the key's MCP tools to
+every completion, and the gateway's own agent loop would run any call to a tool listed in a
+client's `tools_to_auto_execute`, out of sight of the caller's governance. So every
+completion carries the MCP scope headers present and empty, the gateway's deny-all
+(`NO_GATEWAY_TOOLS`), and an `Options` that asks for a scope on a completion is refused
+before anything is sent ([ADR 0003](adr/0003-completions-never-get-gateway-tools.md)).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Application
+    participant SDK as Bifrost (SDK)
+    participant GW as Gateway /v1
+    participant P as Provider
+    participant S as MCP server
+
+    App->>SDK: chat(prompt, options=Options(mcp_clients=["erp"]))
+    SDK-->>App: ValueError: a completion never carries an MCP scope (nothing sent)
+    App->>SDK: chat(prompt, tools=[declared tools], options=Options(session_id=...))
+    SDK->>SDK: headers = options.headers() | NO_GATEWAY_TOOLS
+    SDK->>GW: POST /v1/chat/completions<br/>x-bf-mcp-include-clients: "", x-bf-mcp-include-tools: ""
+    Note over GW: deny-all: none of the key's MCP tools is added to the request
+    GW->>P: the request with only the caller's tools
+    P-->>GW: answer, or a tool call
+    opt the model names a tool in a client's tools_to_auto_execute
+        GW-xS: execution refused under deny-all (logged as an error, never run)
+        GW->>P: the refusal, fed back to the model
+        P-->>GW: the model's answer to that
+    end
+    GW-->>SDK: 200 JSON
+    SDK-->>App: text, or the tool_calls for the caller to run (next section)
+```
+
+A framework's own model client pointed at the gateway (the harness's LangGraph or OpenAI
+Agents models, for example) sends the same two headers as its default headers:
+`bifrost_sdk.NO_GATEWAY_TOOLS`. No header turns the gateway's agent loop off, so keep
+`tools_to_auto_execute` empty, which `MCPClientConfig` does by default.
+
 ## Listing and calling MCP tools
 
 The gateway lists MCP tools to a virtual key only on its own MCP endpoint; `/api/*` is closed
@@ -252,6 +321,78 @@ sequenceDiagram
     end
 ```
 
+## A Virtual MCP and a forwarded caller header
+
+A Virtual MCP is a bundle of tools from several MCP clients behind one endpoint,
+`/mcp/<slug>`, reachable only by the virtual keys it is attached to. A header named in a
+client's `allowed_extra_headers` is forwarded by the gateway to that server on every call, so
+a per-user credential can travel with the call.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator (Admin)
+    participant App as Application (Bifrost)
+    participant API as Gateway /api
+    participant MCP as Gateway /mcp/{slug}
+    participant S as MCP server (erp)
+
+    Op->>API: virtual_mcps.create("Finance Tools", {client id: ["get_stock"], ...})
+    API-->>Op: VirtualMCP(slug="finance-tools"), attached to no key
+    Op->>API: virtual_mcps.attach(vmcp_id, vk_id)
+    App->>MCP: tools(slug="finance-tools"): JSON-RPC tools/list, Bearer virtual key
+    MCP-->>App: only the bundle's tools
+    App->>MCP: execute_tool(call, slug=..., options=Options(extra={"x-user-token": ...}))
+    MCP->>S: tools/call, with x-user-token (named in the client's allowed_extra_headers)
+    S-->>MCP: result for that user
+    MCP-->>App: {"role": "tool", "content": ..., "tool_call_id": ...}
+    App->>MCP: execute_tool(a tool outside the bundle, slug=...)
+    MCP-->>App: an error turn ("is_error": true)
+    App->>MCP: tools(slug="a bundle the key is not attached to")
+    MCP-->>App: 403, PermissionDeniedError
+```
+
+Clients the gateway authenticates per user (`per_user_headers`, `per_user_oauth`) key the
+stored credential by the signed-in user, else the virtual key, else `mcp_session_id`. Under
+one shared virtual key every caller is the same "user", so a credential per person needs a
+key per person or a forwarded header ([api.md](api.md#per-request-options)).
+
+## Stored prompts and skills
+
+The gateway keeps prompts (versioned chat messages with model parameters) and Agent Skills
+(a `SKILL.md` body with files). An operator writes them with `Admin`; an application selects
+a prompt per request with `Options`, and the gateway prepends it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator (Admin)
+    participant App as Application
+    participant API as Gateway /api
+    participant V1 as Gateway /v1
+    participant P as Provider
+
+    Op->>API: prompts.create("triage"), then prompts.commit(id, messages, model="provider/model")
+    API-->>Op: PromptVersion(number=1, is_latest=True)
+    App->>API: prompts.find("triage"): names to ids, once
+    API-->>App: Prompt(id, latest_version)
+    App->>V1: chat(ticket, options=Options(prompt_id=id, prompt_version=1))
+    Note over V1: x-bf-prompt-id, x-bf-prompt-version: prepend that version's messages,<br/>apply its model_params where the request set none
+    V1->>P: stored messages + the request's messages
+    P-->>V1: answer
+    V1-->>App: text
+    Note over App,V1: an unknown id or version is not an error: the request goes without the template
+
+    Op->>API: skills.create("sql-review", body=..., version="1.0.0", files={path: text})
+    API-->>Op: Skill (version 1.0.0 published and served)
+    App->>API: skills.find("sql-review"), then skills.read_file("sql-review", "references/rules.md")
+    API-->>App: Skill with body and file list, then the served version's file bytes
+    Op->>API: skills.publish(id, version="1.1.0", ...) or skills.shift_version(id, "1.0.0")
+```
+
+Versions only go up: a prompt version is the next number, and reusing a skill version is a 409
+`ConflictError`. A skill file of a version that is not served cannot be read back.
+
 ## Errors
 
 Every exception is a `BifrostError` and carries `retryable` (whether the same call may succeed
@@ -300,11 +441,77 @@ classDiagram
     GatewayError <|-- ServerError : 5xx
 ```
 
+Any other error status (`408`, `413`, ...) is a plain `GatewayError`. The typed classes are
+subclasses, so `except GatewayError` still catches every one of them.
+
+Every error carries `retryable`: whether the *same* call may succeed if made again later.
+It is `True` for `Unreachable`, `RateLimited`, `CircuitOpen`, and for a `GatewayError` whose
+status is in `RETRYABLE` (`408, 409, 425, 500, 502, 503, 504`); `False` for everything else —
+including a `501`, a `GatewayError` without a status, `EmptyResponse` and `InvalidJSON`.
+Callers above this client read it rather than re-deriving the rule.
+
+| Raised by | `Unreachable` | `RateLimited` | `GatewayError` | `CircuitOpen` | `EmptyResponse` | `InvalidJSON` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `chat`, `complete`* | after retries | after retries | yes | yes | `chat` only | |
+| `json` | after retries | after retries | yes | yes | yes | yes |
+| `stream` | yes | yes | yes | yes | | |
+| `tools`, `execute_tool`, `mcp_logs`, `bf.mcp.*`, `Admin.*` | yes | yes | yes | | | |
+| `ping` | never raises | | | | | |
+
+\* `complete` returns the payload as it is, so an empty answer is the caller's to read.
+Invalid arguments (no model, a naive `since`, a tool call without a name, an unregistrable
+MCP connection) raise `ValueError` before any request is sent.
+
+```python
+from bifrost_sdk import (
+    BadRequestError,
+    BifrostError,
+    CircuitOpen,
+    EmptyResponse,
+    GatewayError,
+    RateLimited,
+)
+
+try:
+    text = await bf.chat(prompt)
+except RateLimited as exc:  # healthy gateway asking for less: wait exc.retry_after
+    ...
+except CircuitOpen as exc:  # nothing was sent; the gateway was failing moments ago
+    ...
+except EmptyResponse:  # a reasoning model spent the budget: raise max_tokens
+    ...
+except BadRequestError:  # this request will never work as sent: change it
+    ...
+except GatewayError as exc:  # exc.status, exc.retryable, exc.details["body"]
+    ...
+except BifrostError:  # Unreachable, InvalidJSON
+    ...
+```
+
+**Why a 429 is not a `GatewayError`.** A 429 means the gateway is healthy and saying so; the
+circuit breaker does not count it, or "slow down" becomes "stop". Measured on a real run: 17
+rate limits opened a breaker and the next 62 calls failed instantly without a request ever
+being sent. Code that catches `GatewayError` to count failures has therefore never seen a
+429, and the typed `RateLimitedError` keeps it so.
+
+**Why `EmptyResponse` exists.** Reasoning models spend the output budget on thinking before
+emitting anything, so too small a `max_tokens` returns 200 OK with `""` and
+`finish_reason="length"`. Measured against one such model, "Reply with exactly: OK" consumed
+57 reasoning tokens. Returning `""` would push a silently degraded answer into every call
+site. Its `.details` carry `completion_tokens` and `reasoning_tokens`.
+
 ## Retry policy
 
 Only `chat`, `json` and `complete` retry, on a status in `RETRYABLE` (`408, 409, 425, 429,
-500, 502, 503, 504`) or a transport failure, up to `max_retries` times. The wait before each
-retry:
+500, 502, 503, 504`) or a transport failure, up to `max_retries` times. Everything else is
+the caller's mistake and is raised on the first attempt: retrying a 400 only spends the
+budget. A `200` whose body is not JSON is a gateway fault: raised at once, counted by the
+breaker.
+
+The wait comes from `Retry-After` when the gateway sends one, as a delay or an HTTP date, and
+from the *body* when it does not: some providers answer "Please retry in 59.18s" with no
+header at all. No wait is longer than 30 seconds (`bifrost_sdk._retry.MAX_WAIT`), whoever
+asked for it. The wait before each retry:
 
 ```mermaid
 flowchart TB
@@ -350,11 +557,16 @@ stateDiagram-v2
 
 ## Design decisions
 
+The three that shape the rest have ADRs: [0001](adr/0001-constructor-arguments-only.md) (no
+environment reading), [0002](adr/0002-retries-and-the-circuit-breaker.md) (what is retried
+and what trips the breaker) and [0003](adr/0003-completions-never-get-gateway-tools.md) (the
+deny-all MCP scope on every completion).
+
 - **The gateway holds the credentials.** The SDK sends a virtual key, never a provider key,
   and imports no provider SDK; changing provider is changing a model string.
 - **A 429 is not a failure.** `RateLimited` (and `RateLimitedError`) is not a `GatewayError`
   and never trips the breaker; its delay comes from `Retry-After` or from the body, where
-  Gemini puts it.
+  some providers put it.
 - **Only a sick gateway trips the breaker.** 5xx and transport failures count; a 4xx is a
   verdict on one request (or one key) and counts for nothing, so one caller's bad prompts or
   bad key cannot fail every other caller in the process.
