@@ -78,10 +78,10 @@ async def test_a_key_carries_its_provider_and_mcp_allow_lists() -> None:
     admin = client(handler)
     await admin.vk.create(
         "triage-agent",
-        provider_configs=[{"provider": "gemini", "allowed_models": ["gemini-3.6-flash"]}],
+        provider_configs=[{"provider": "provider-a", "allowed_models": ["model-a"]}],
         mcp_configs=[{"mcp_client_name": "memory", "tools_to_execute": ["recall"]}],
     )
-    assert seen["body"]["provider_configs"][0]["provider"] == "gemini"
+    assert seen["body"]["provider_configs"][0]["provider"] == "provider-a"
     assert seen["body"]["mcp_configs"][0]["tools_to_execute"] == ["recall"]
     await admin.aclose()
 

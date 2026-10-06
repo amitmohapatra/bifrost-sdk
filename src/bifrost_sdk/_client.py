@@ -2,7 +2,7 @@
 
 Three verbs, because there are three things callers do::
 
-    async with Bifrost("http://gateway/v1", model="gemini/gemini-3.6-flash") as bf:
+    async with Bifrost("http://gateway/v1", model="provider/model") as bf:
         text = await bf.chat("summarise this")                  # -> str
         data = await bf.json("extract the fields", schema=S)    # -> dict
         async for delta in bf.stream("write a story"):          # -> AsyncIterator[str]

@@ -122,7 +122,7 @@ class EmptyResponse(BifrostError):
 
     Reasoning models spend the output budget on thinking before emitting anything, so too
     small a ``max_tokens`` comes back 200 OK with an empty string and ``finish_reason=length``.
-    Measured against gemini-3.6-flash: "Reply with exactly: OK" consumed 57 reasoning tokens.
+    Measured against a reasoning model: "Reply with exactly: OK" consumed 57 reasoning tokens.
     Returning "" would push a silently degraded answer into every call site.
     """
 
@@ -165,7 +165,7 @@ _BY_STATUS: dict[int, type[GatewayError]] = {
 def from_response(response: httpx.Response) -> RateLimitedError | GatewayError:
     """The error an error-status response means.
 
-    The whole body is parsed and only an excerpt carried: Gemini's quota reply puts
+    The whole body is parsed and only an excerpt carried: one provider's quota reply puts
     "Please retry in 28.9s." at index 483 of 751, so truncating before parsing lost the delay.
     """
     body = response.text
