@@ -24,7 +24,7 @@ RETRYABLE = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 #: (the harness's runs client, the memory SDK) caps at the same thirty seconds.
 MAX_WAIT = 30.0
 
-#: Some providers put the delay in the error *body* rather than the header — Gemini answers
+#: Some providers put the delay in the error *body* rather than the header — one answers
 #: "Please retry in 59.18s". A client that only reads the header sees nothing and falls back
 #: to a backoff measured in milliseconds against a window measured in a minute.
 _IN_BODY = re.compile(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", re.I)

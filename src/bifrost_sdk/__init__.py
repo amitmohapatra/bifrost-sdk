@@ -2,7 +2,7 @@
 
     from bifrost_sdk import Bifrost, Options
 
-    async with Bifrost("http://gateway/v1", model="gemini/gemini-3.6-flash") as bf:
+    async with Bifrost("http://gateway/v1", model="provider/model") as bf:
         text = await bf.chat("summarise this")
         data = await bf.json("extract the fields", schema=SCHEMA)
         async for delta in bf.stream("write a story"):

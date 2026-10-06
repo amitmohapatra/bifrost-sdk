@@ -123,7 +123,7 @@ async def test_stream_yields_deltas_unbuffered() -> None:
 async def test_an_exhausted_output_budget_is_an_error_not_an_empty_string() -> None:
     """A reasoning model spends the budget thinking before it emits anything.
 
-    Measured against gemini-3.6-flash: "Reply with exactly: OK" consumed 57 reasoning tokens,
+    Measured against a reasoning model: "Reply with exactly: OK" consumed 57 reasoning tokens,
     so a small max_tokens comes back 200 OK with "" and finish_reason=length. Returning that
     as a completion pushes a silently degraded answer into every call site.
     """
@@ -168,7 +168,7 @@ async def test_retry_after_header_is_honoured_over_the_backoff() -> None:
 
 
 async def test_retry_delay_is_read_from_the_body_when_there_is_no_header() -> None:
-    """Gemini answers "Please retry in 59.18s" in the body and sends no Retry-After header.
+    """Some providers answer "Please retry in 59.18s" in the body and sends no Retry-After header.
 
     A client that only reads the header sees nothing and falls back to a backoff measured in
     milliseconds against a window measured in a minute.
@@ -441,7 +441,7 @@ async def test_options_send_every_field_as_its_gateway_header() -> None:
         customer_name="Acme Industrial",
         dimensions={"team": "payments"},
     )
-    await bf.chat("what changed?", model="gemini/gemini-3.6-flash", options=options)
+    await bf.chat("what changed?", model="provider/model", options=options)
     assert seen["headers"] == {
         "x-bf-prompt-id": "p-123",
         "x-bf-prompt-version": "3",
@@ -453,7 +453,7 @@ async def test_options_send_every_field_as_its_gateway_header() -> None:
         "x-bf-customer-name": "Acme Industrial",
         "x-bf-dim-team": "payments",
     }
-    assert seen["body"]["model"] == "gemini/gemini-3.6-flash"
+    assert seen["body"]["model"] == "provider/model"
     await bf.aclose()
 
 
@@ -570,10 +570,10 @@ async def test_a_routing_header_is_sent_verbatim() -> None:
     await bf.aclose()
 
 
-def test_the_delay_is_read_from_a_real_gemini_quota_body() -> None:
+def test_the_delay_is_read_from_a_real_provider_quota_body() -> None:
     """Captured from the live gateway, not written from the documentation.
 
-    Gemini answers 429 with the delay in the *body* and no ``Retry-After`` header at all.
+    The provider answers 429 with the delay in the *body* and no ``Retry-After`` header at all.
     A client that reads only the header sees nothing, falls back to an exponential backoff
     measured in milliseconds, and spends its whole retry budget inside a window measured in
     seconds — which is how a rate limit becomes a failed request instead of a slow one.
@@ -581,11 +581,11 @@ def test_the_delay_is_read_from_a_real_gemini_quota_body() -> None:
     captured = (
         "You exceeded your current quota, please check your plan and billing details. "
         "For more information on this error, head to: "
-        "https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, "
+        "https://ai.google.dev/provider-x/docs/rate-limits. To monitor your current usage, "
         "head to: https://ai.dev/rate-limit. \n"
         "* Quota exceeded for metric: "
         "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
-        "limit: 20, model: gemini-3.6-flash\n"
+        "limit: 20, model: provider-model-x\n"
         "Please retry in 8.586631853s."
     )
 
@@ -610,10 +610,10 @@ async def test_a_long_rate_limit_body_still_yields_its_delay() -> None:
         '{"is_bifrost_error":false,"status_code":429,"error":{"type":"RESOURCE_EXHAUSTED",'
         '"code":"429","message":"You exceeded your current quota, please check your plan and '
         "billing details. For more information on this error, head to: "
-        "https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, "
+        "https://ai.google.dev/provider-x/docs/rate-limits. To monitor your current usage, "
         "head to: https://ai.dev/rate-limit. \\n* Quota exceeded for metric: "
         "generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, "
-        'model: gemini-3.6-flash\\nPlease retry in 28.973095374s."}}'
+        'model: provider-model-x\\nPlease retry in 28.973095374s."}}'
     )
     assert len(body) > 500, "the point of this test is a body longer than the excerpt"
     assert body.index("Please retry in") > 400, "and advice that lands past the cut"
@@ -623,7 +623,7 @@ async def test_a_long_rate_limit_body_still_yields_its_delay() -> None:
 
     client = Bifrost(
         "http://gateway/v1",
-        model="gemini/gemini-3.6-flash",
+        model="provider/model",
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
         ),

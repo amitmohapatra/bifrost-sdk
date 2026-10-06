@@ -21,3 +21,7 @@ jobs:
       # Unit tests only: the gateway is mocked, nothing touches the network. The live tests
       # are deselected by default (pyproject addopts) and skip without BIFROST_URL anyway.
       - run: uv run pytest -q
+      # every numbered example runs offline, against the in-process fake gateway
+      - run: make examples
+      # every relative Markdown link and anchor resolves
+      - run: make links
