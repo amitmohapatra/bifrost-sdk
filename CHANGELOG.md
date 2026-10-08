@@ -14,6 +14,14 @@ go with which is in [docs/versioning.md](docs/versioning.md); the reasons are in
   completion, a Virtual MCP with a forwarded header, and prompts and skills;
   [configuration](docs/configuration.md), [troubleshooting](docs/troubleshooting.md),
   [versioning](docs/versioning.md) and three [ADRs](docs/adr/README.md).
+* Live tests need no public host: the MCP servers they register are local ones
+  (`tests/local_mcp.py`, on free loopback ports for the session) in place of DeepWiki and
+  Context7, and they register them as the gateway's admin (login, session token as
+  `admin_token=`). With `BIFROST_LIVE_GATEWAY_BIN` they start and stop their own gateway
+  (`tests/live_gateway.py`); against a running one, `BIFROST_LIVE_ADMIN_USERNAME` and
+  `BIFROST_LIVE_ADMIN_PASSWORD`. `BIFROST_LIVE_MCP_URL` and `BIFROST_LIVE_ANNOTATED_MCP_URL`
+  are gone, and so is the `sdklocal` client a gateway's `config.json` had to declare.
+  ([README, Development](README.md#development))
 * Eight offline examples against an in-process fake gateway ([examples/](examples/README.md)),
   a `Makefile` with the targets CI runs, and a link check; CI runs the examples and the link
   check.

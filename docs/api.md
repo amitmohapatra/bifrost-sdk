@@ -202,8 +202,10 @@ await bf.mcp.remove(erp.id)
 changes name, tool allow-lists, the Code Mode flag and `allowed_extra_headers` (the caller
 headers forwarded to the server, see per-user credentials above). The gateway answers 200 to a connection
 change and ignores it, so `update` refuses one: remove the client and add it again.
-`tools_to_auto_execute` (Agent Mode) defaults to empty. The gateway refuses private-network
-MCP targets to unauthenticated callers.
+`tools_to_auto_execute` (Agent Mode) defaults to empty. The gateway refuses loopback,
+private-network and link-local MCP targets to unauthenticated callers: with dashboard auth on
+(an admin password), pass the admin's session token (from `POST /api/session/login`) as
+`admin_token=`.
 
 `/api/*` routes authenticate with `admin_token=` (defaulting to `api_key=`).
 
