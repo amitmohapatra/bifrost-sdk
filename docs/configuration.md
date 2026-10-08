@@ -93,10 +93,12 @@ that gateway.
 
 | Variable | Default | What it is |
 |---|---|---|
-| `BIFROST_URL` | unset: the live tests skip | the gateway's `/v1` URL; `BIFROST_LIVE_URL` is still read when it is unset |
+| `BIFROST_LIVE_GATEWAY_BIN` | unset | a `bifrost-http` binary: the tests start their own gateway from it (free port, own app directory, dashboard auth) and stop it afterwards |
+| `BIFROST_LIVE_GATEWAY_CONFIG` | unset: no providers | the `config.json` the started gateway's is derived from (its providers) |
+| `BIFROST_LIVE_GATEWAY_DIR` | pytest's temporary directory | where the started gateway's app directory is made |
+| `BIFROST_URL` | unset: the live tests skip, unless `BIFROST_LIVE_GATEWAY_BIN` is set | a running gateway's `/v1` URL; `BIFROST_LIVE_URL` is still read when it is unset |
+| `BIFROST_LIVE_ADMIN_USERNAME`, `BIFROST_LIVE_ADMIN_PASSWORD` | unset: the tests that register MCP servers skip | that running gateway's admin login (the gateway registers loopback MCP servers only for its admin) |
 | `BIFROST_LIVE_MODEL` | unset: the tests that complete skip | a `provider/model` the gateway serves |
-| `BIFROST_LIVE_MCP_URL` | the public DeepWiki MCP server | an MCP server that publishes no annotations |
-| `BIFROST_LIVE_ANNOTATED_MCP_URL` | the public Context7 MCP server | an MCP server that publishes annotations |
 
 The examples read nothing: they run against an in-process fake gateway
 ([examples/](../examples/README.md)).

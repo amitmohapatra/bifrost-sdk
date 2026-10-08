@@ -1,19 +1,22 @@
-"""Against a running gateway. Opt-in: ``pytest -m live`` with ``BIFROST_URL`` set (e.g.
-``http://localhost:8091/v1``) — the name every other repository in the platform uses for the
-gateway. ``BIFROST_LIVE_URL`` is still read when ``BIFROST_URL`` is unset, as an alias.
+"""Against a real gateway and real MCP servers, none of them public. Opt-in: ``pytest -m live``.
 
-Registers temporary MCP clients (``BIFROST_LIVE_MCP_URL``, default the public DeepWiki
-server — the gateway refuses private-network targets to unauthenticated callers; and
-``BIFROST_LIVE_ANNOTATED_MCP_URL``, default the public Context7 server, which publishes MCP
-tool annotations) and removes them afterwards. Skipped when neither variable is set or the
-gateway is unreachable. Deselected by a plain ``pytest`` (``addopts`` in ``pyproject.toml``):
-``BIFROST_URL`` is set in shells that never meant to register clients on that gateway.
+The gateway is one the tests start (``BIFROST_LIVE_GATEWAY_BIN``, a ``bifrost-http`` binary:
+``live_gateway.py`` runs it on a free port with its own app directory, dashboard auth on and a
+test ``config.json`` derived from ``BIFROST_LIVE_GATEWAY_CONFIG``, and stops it afterwards), or
+the running one ``BIFROST_URL`` names (``BIFROST_LIVE_URL`` is still read when it is unset) —
+the tests skip when neither is set or the gateway is unreachable. Deselected by a plain
+``pytest`` (``addopts`` in ``pyproject.toml``): ``BIFROST_URL`` is set in shells that never
+meant to register clients on that gateway.
+
+The MCP servers are ``local_mcp.py``'s, served on free loopback ports for the session. The
+tests register them as temporary MCP clients and remove them afterwards. The gateway refuses
+loopback targets to unauthenticated callers, so they register as its admin: the started
+gateway logs them in; a running one needs ``BIFROST_LIVE_ADMIN_USERNAME`` and
+``BIFROST_LIVE_ADMIN_PASSWORD`` (they skip without).
 
 The tests of the prompt and skills repositories, Virtual MCPs, per-user headers and the
 no-gateway-tools guarantee create (and delete) their own prompts, skills, Virtual MCPs and
-virtual keys. Those that complete need ``BIFROST_LIVE_MODEL`` (``provider/model``); those that
-run tools need the local MCP server of ``local_mcp.py`` declared in the gateway's
-``config.json`` (they start the server; they skip when the gateway does not know it).
+virtual keys. Those that complete need ``BIFROST_LIVE_MODEL`` (``provider/model``).
 """
 
 from __future__ import annotations
@@ -23,13 +26,14 @@ import contextlib
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
+import live_gateway
 import local_mcp
 from bifrost_sdk import (
     Bifrost,
@@ -39,18 +43,19 @@ from bifrost_sdk import (
     MCPConnection,
     Options,
     PermissionDeniedError,
+    ToolAnnotations,
 )
 from bifrost_sdk.admin import Admin
+from live_gateway import Gateway
 
 pytestmark = pytest.mark.live
 
-LIVE_URL = os.environ.get("BIFROST_URL") or os.environ.get("BIFROST_LIVE_URL")
 #: ``provider/model`` the completion tests use; they skip without it.
 LIVE_MODEL = os.environ.get("BIFROST_LIVE_MODEL")
-MCP_URL = os.environ.get("BIFROST_LIVE_MCP_URL", "https://mcp.deepwiki.com/mcp")
-ANNOTATED_MCP_URL = os.environ.get("BIFROST_LIVE_ANNOTATED_MCP_URL", "https://mcp.context7.com/mcp")
-#: A tool the default server exposes, and one it exposes that the client will not allow.
+#: A tool the wiki server exposes, and one it exposes that the client will not allow.
 TOOL, OTHER = "read_wiki_structure", "ask_wiki_question"
+#: A repository the wiki server knows.
+REPO = "maximhq/bifrost"
 #: How long discovery and the asynchronous log writer get before a test gives up.
 SETTLE_SECONDS = 20.0
 POLL_SECONDS = 0.5
@@ -65,43 +70,71 @@ async def _eventually(probe):
     raise AssertionError("condition not met in time")
 
 
+@pytest.fixture(scope="session")
+def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
+    """The gateway for the session: started (and stopped) here, or an existing one."""
+    chosen = live_gateway.from_environment(tmp_path_factory.mktemp("gateway"))
+    if chosen is None:
+        pytest.skip("neither BIFROST_LIVE_GATEWAY_BIN nor BIFROST_URL (BIFROST_LIVE_URL) set")
+    with chosen as running:
+        yield running
+
+
+@pytest.fixture(scope="session")
+def servers() -> Iterator[local_mcp.Servers]:
+    """``local_mcp``'s servers, listening for the session."""
+    with local_mcp.running() as listening:
+        yield listening
+
+
 @pytest.fixture
-async def bf() -> AsyncIterator[Bifrost]:
-    if not LIVE_URL:
-        pytest.skip("BIFROST_URL (or BIFROST_LIVE_URL) not set")
-    client = Bifrost(LIVE_URL)
+async def bf(gateway: Gateway) -> AsyncIterator[Bifrost]:
+    """An unscoped caller (no virtual key) with the gateway's admin token for ``/api/*``."""
+    client = Bifrost(gateway.url, admin_token=gateway.admin_token)
     if not await client.ping():
         await client.aclose()
-        pytest.skip(f"no gateway at {LIVE_URL}")
+        pytest.skip(f"no gateway at {gateway.url}")
     yield client
     await client.aclose()
 
 
 @asynccontextmanager
-async def _registered(bf: Bifrost, url: str, allowed: tuple[str, ...]) -> AsyncIterator[MCPClient]:
+async def _registered(
+    bf: Bifrost, gateway: Gateway, url: str, allowed: tuple[str, ...], **config: object
+) -> AsyncIterator[MCPClient]:
     """A temporary client for ``url``, once the gateway has discovered its tools."""
-    config = MCPClientConfig(
+    if gateway.admin_token is None:
+        pytest.skip(
+            "registering a local MCP server needs the gateway's admin: set "
+            "BIFROST_LIVE_ADMIN_USERNAME and BIFROST_LIVE_ADMIN_PASSWORD, or "
+            "BIFROST_LIVE_GATEWAY_BIN to have the tests start a gateway"
+        )
+    desired = MCPClientConfig(
         name=f"bfsdklive{uuid.uuid4().hex[:8]}",
         connection=MCPConnection(type="http", url=url),
         tools_to_execute=allowed,
+        **config,
     )
-    await bf.mcp.add(config)
+    await bf.mcp.add(desired)
     try:
 
         async def discovered() -> MCPClient | None:
-            found = [c for c in await bf.mcp.clients() if c.config.name == config.name]
+            found = [c for c in await bf.mcp.clients() if c.config.name == desired.name]
             return found[0] if found and found[0].tools else None
 
         yield await _eventually(discovered)
     finally:
         for client in await bf.mcp.clients():
-            if client.config.name == config.name:
+            if client.config.name == desired.name:
                 await bf.mcp.remove(client.id)
 
 
 @pytest.fixture
-async def probe(bf: Bifrost) -> AsyncIterator[MCPClient]:
-    async with _registered(bf, MCP_URL, (TOOL,)) as client:
+async def probe(
+    bf: Bifrost, gateway: Gateway, servers: local_mcp.Servers
+) -> AsyncIterator[MCPClient]:
+    """The wiki server (no annotations), allowed to run :data:`TOOL` only."""
+    async with _registered(bf, gateway, servers.wiki, (TOOL,)) as client:
         yield client
 
 
@@ -113,8 +146,10 @@ def _call(name: str, arguments: dict[str, str]) -> dict:
     }
 
 
-async def test_the_registered_client_reads_back_typed(bf: Bifrost, probe: MCPClient) -> None:
-    assert probe.config.connection == MCPConnection(type="http", url=MCP_URL)
+async def test_the_registered_client_reads_back_typed(
+    bf: Bifrost, probe: MCPClient, servers: local_mcp.Servers
+) -> None:
+    assert probe.config.connection == MCPConnection(type="http", url=servers.wiki)
     assert probe.config.tools_to_execute == (TOOL,)
     assert f"{probe.config.name}-{OTHER}" in {t.name for t in probe.tools}
     assert [t.name for t in probe.executable] == [f"{probe.config.name}-{TOOL}"]
@@ -130,11 +165,11 @@ async def test_tools_are_scoped_like_the_include_headers(bf: Bifrost, probe: MCP
 
 async def test_execution_honours_scope_and_allow_list(bf: Bifrost, probe: MCPClient) -> None:
     name = probe.config.name
-    args = {"repoName": "maximhq/bifrost"}
+    args = {"repoName": REPO}
     turn = await bf.execute_tool(
         _call(f"{name}-{TOOL}", args), options=Options(mcp_tools=[f"{name}-*"])
     )
-    assert turn["role"] == "tool" and turn["content"]
+    assert turn["role"] == "tool" and turn["content"] == local_mcp.structure(REPO)
     for refused, options in (
         (f"{name}-{TOOL}", Options(mcp_clients=[])),  # present-and-empty is deny-all
         (f"{name}-{TOOL}", Options(mcp_tools=[TOOL])),  # bare names never match
@@ -154,7 +189,7 @@ async def test_code_mode_nested_calls_are_found_by_parent(bf: Bifrost, probe: MC
 
     parent = f"live-{uuid.uuid4().hex}"
     since = datetime.now(UTC) - timedelta(seconds=5)
-    code = f'r = {name}.{TOOL}(repoName="maximhq/bifrost")\nresult = 1'
+    code = f'r = {name}.{TOOL}(repoName="{REPO}")\nresult = 1'
     turn = await bf.execute_tool(
         _call("executeToolCode", {"code": code}), options=Options(parent_request_id=parent)
     )
@@ -166,7 +201,7 @@ async def test_code_mode_nested_calls_are_found_by_parent(bf: Bifrost, probe: MC
     [log] = await _eventually(logged)
     assert (log.client, log.tool, log.status) == (name, TOOL, "success")
     assert log.parent_request_id == parent
-    assert log.arguments == {"repoName": "maximhq/bifrost"}
+    assert log.arguments == {"repoName": REPO}
 
 
 async def test_a_connection_change_is_refused_locally(bf: Bifrost, probe: MCPClient) -> None:
@@ -177,27 +212,36 @@ async def test_a_connection_change_is_refused_locally(bf: Bifrost, probe: MCPCli
         await bf.mcp.update(probe, moved)
 
 
-async def test_annotations_survive_the_gateway(bf: Bifrost) -> None:
-    """The server's MCP annotations reach ``ToolDef``; a server without them gives ``None``."""
-    async with _registered(bf, ANNOTATED_MCP_URL, ("*",)) as annotated:
-        assert annotated.tools
-        for tool in annotated.tools:
-            assert tool.annotations is not None
-            assert tool.annotations.read_only_hint is True
-        [listed] = await bf.tools(clients=[annotated.config.name], only=[annotated.tools[0].name])
-        assert listed.annotations == annotated.tools[0].annotations
+async def test_annotations_survive_the_gateway(
+    bf: Bifrost, gateway: Gateway, servers: local_mcp.Servers
+) -> None:
+    """Each tool's MCP annotations reach ``ToolDef`` exactly as the server published them —
+    in the admin registry and in the listing a caller gets."""
+    async with _registered(bf, gateway, servers.annotated, ("*",)) as annotated:
+        name = annotated.config.name
+        published = {
+            f"{name}-{tool}": ToolAnnotations.model_validate(hints)
+            for tool, hints in local_mcp.ANNOTATED.items()
+        }
+        assert {t.name: t.annotations for t in annotated.tools} == published
+        listed = await bf.tools(clients=[name])
+        assert {t.name: t.annotations for t in listed} == published
 
 
-async def test_a_server_without_annotations_lists_none(probe: MCPClient) -> None:
+async def test_a_server_without_annotations_lists_none(bf: Bifrost, probe: MCPClient) -> None:
+    assert probe.tools
     assert all(t.annotations is None for t in probe.tools)
+    [listed] = await bf.tools(clients=[probe.config.name])
+    assert listed.annotations is None
 
 
-async def test_a_virtual_key_lists_only_the_tools_it_allows(bf: Bifrost) -> None:
+async def test_a_virtual_key_lists_only_the_tools_it_allows(
+    bf: Bifrost, gateway: Gateway, servers: local_mcp.Servers
+) -> None:
     """``tools()`` under a virtual key is that key's MCP allow-list, as the gateway reads it."""
-    assert LIVE_URL is not None
     async with (
-        _registered(bf, MCP_URL, ("*",)) as registered,
-        Admin(LIVE_URL) as admin,
+        _registered(bf, gateway, servers.wiki, ("*",)) as registered,
+        Admin(gateway.url, token=gateway.admin_token) as admin,
     ):
         name = registered.config.name
         created = await admin.vk.create(
@@ -206,7 +250,7 @@ async def test_a_virtual_key_lists_only_the_tools_it_allows(bf: Bifrost) -> None
         )
         key = created["virtual_key"]
         try:
-            async with Bifrost(LIVE_URL, api_key=key["value"]) as scoped:
+            async with Bifrost(gateway.url, api_key=key["value"]) as scoped:
                 assert [t.name for t in await scoped.tools()] == [f"{name}-{TOOL}"]
         finally:
             await admin.vk.delete(key["id"])
@@ -227,9 +271,8 @@ def _unique(prefix: str) -> str:
 
 
 @pytest.fixture
-async def admin(bf: Bifrost) -> AsyncIterator[Admin]:
-    assert LIVE_URL is not None
-    async with Admin(LIVE_URL) as client:
+async def admin(bf: Bifrost, gateway: Gateway) -> AsyncIterator[Admin]:
+    async with Admin(gateway.url, token=gateway.admin_token) as client:
         yield client
 
 
@@ -248,24 +291,22 @@ async def _key(admin: Admin, mcp_configs: list[dict]) -> AsyncIterator[dict]:
 
 
 @pytest.fixture
-async def local(bf: Bifrost) -> AsyncIterator[MCPClient]:
-    """The gateway's client for ``local_mcp``, with the server running and its tools known."""
-    async with local_mcp.serving():
-        found = [c for c in await bf.mcp.clients() if c.config.name == local_mcp.CLIENT]
-        if not found:
-            pytest.skip(f"the gateway's config.json declares no {local_mcp.CLIENT!r} MCP client")
-        if not found[0].tools:  # the server was down when the gateway listed it
-            assert LIVE_URL is not None
-            async with httpx.AsyncClient(base_url=LIVE_URL.removesuffix("/v1")) as http:
-                await http.post(f"/api/mcp/client/{found[0].id}/refresh-tools")
-        yield found[0]
+async def local(
+    bf: Bifrost, gateway: Gateway, servers: local_mcp.Servers
+) -> AsyncIterator[MCPClient]:
+    """The local server (``echo``, ``whoami``), every tool allowed, forwarding
+    :data:`local_mcp.USER_HEADER` from the caller."""
+    async with _registered(
+        bf, gateway, servers.local, ("*",), allowed_extra_headers=(local_mcp.USER_HEADER,)
+    ) as client:
+        yield client
 
 
 def _granted(client: MCPClient) -> list[dict]:
     return [{"mcp_client_name": client.config.name, "tools_to_execute": ["*"]}]
 
 
-async def test_a_prompt_is_committed_resolved_and_applied(admin: Admin) -> None:
+async def test_a_prompt_is_committed_resolved_and_applied(admin: Admin, gateway: Gateway) -> None:
     """The stored template reaches the model: the prompt is exactly the template followed by
     the request's own turn (the same token count as sending both), and the reply follows it
     — on ``complete`` and on ``stream``."""
@@ -282,8 +323,7 @@ async def test_a_prompt_is_committed_resolved_and_applied(admin: Admin) -> None:
         assert [v.number for v in await admin.prompts.versions(prompt.id)] == [1]
         assert await admin.prompts.version(version.id) == version
 
-        assert LIVE_URL is not None
-        async with _key(admin, []) as key, Bifrost(LIVE_URL, api_key=key["value"]) as bf:
+        async with _key(admin, []) as key, Bifrost(gateway.url, api_key=key["value"]) as bf:
             question = "What is 2 + 2?"
             turns = [system, {"role": "user", "content": question}]
             sent = await bf.complete(turns, model=model, max_tokens=20)
@@ -335,38 +375,37 @@ async def test_a_skill_is_published_read_back_and_shifted(admin: Admin) -> None:
     assert await admin.skills.find(name) is None
 
 
-def _whoami(call_id: str = "live-who") -> dict:
-    return _call(f"{local_mcp.CLIENT}-whoami", {}) | {"id": call_id}
+def _whoami(local: MCPClient, call_id: str = "live-who") -> dict:
+    return _call(f"{local.config.name}-whoami", {}) | {"id": call_id}
 
 
 async def test_a_callers_header_reaches_the_mcp_server_as_theirs(
-    admin: Admin, local: MCPClient
+    admin: Admin, gateway: Gateway, local: MCPClient
 ) -> None:
     """Per-user credentials: the gateway forwards the header the client allows, per call —
     through ``/v1/mcp/tool/execute`` and through the client's own ``/mcp/<slug>``."""
     assert local.config.allowed_extra_headers == (local_mcp.USER_HEADER,)
-    assert LIVE_URL is not None
-    async with _key(admin, _granted(local)) as key, Bifrost(LIVE_URL, api_key=key["value"]) as bf:
+    url = gateway.url
+    async with _key(admin, _granted(local)) as key, Bifrost(url, api_key=key["value"]) as bf:
         for user in ("alice", "bob"):
             options = Options(extra={local_mcp.USER_HEADER: user})
-            for slug in (None, local_mcp.CLIENT):
-                turn = await bf.execute_tool(_whoami(), options=options, slug=slug)
+            for slug in (None, local.config.name):
+                turn = await bf.execute_tool(_whoami(local), options=options, slug=slug)
                 assert (turn["content"], turn.get("is_error")) == (user, None)
-        anonymous = await bf.execute_tool(_whoami())
+        anonymous = await bf.execute_tool(_whoami(local))
         assert anonymous["is_error"] is True
 
 
 async def test_a_virtual_mcp_scopes_what_a_key_lists_and_runs(
-    admin: Admin, local: MCPClient
+    admin: Admin, gateway: Gateway, local: MCPClient
 ) -> None:
     """A bundle is reachable only once attached, and through its slug only its tools run."""
-    echo = f"{local_mcp.CLIENT}-echo"
+    echo = f"{local.config.name}-echo"
     vmcp = await admin.virtual_mcps.create(_unique("bfsdklive vmcp"), {local.id: ["echo"]})
-    assert LIVE_URL is not None
     try:
         assert vmcp.tools == {local.id: ("echo",)}
         assert vmcp.enabled and vmcp.virtual_key_ids == ()
-        async with _key(admin, []) as key, Bifrost(LIVE_URL, api_key=key["value"]) as bf:
+        async with _key(admin, []) as key, Bifrost(gateway.url, api_key=key["value"]) as bf:
             with pytest.raises(PermissionDeniedError):
                 await bf.tools(slug=vmcp.slug)
             await admin.virtual_mcps.attach(vmcp.id, key["id"])
@@ -376,7 +415,7 @@ async def test_a_virtual_mcp_scopes_what_a_key_lists_and_runs(
             said = await bf.execute_tool(_call(echo, {"text": "hi"}), slug=vmcp.slug)
             assert said["content"] == "hi"
             outside = Options(extra={local_mcp.USER_HEADER: "alice"})
-            refused = await bf.execute_tool(_whoami(), options=outside, slug=vmcp.slug)
+            refused = await bf.execute_tool(_whoami(local), options=outside, slug=vmcp.slug)
             assert refused["is_error"] is True
 
             renamed = await admin.virtual_mcps.update(vmcp.id, name=_unique("bfsdklive renamed"))
@@ -390,13 +429,13 @@ async def test_a_virtual_mcp_scopes_what_a_key_lists_and_runs(
         await admin.virtual_mcps.delete(vmcp.id)
 
 
-async def _echo_runs(bf: Bifrost, since: datetime) -> list[str]:
+async def _echo_runs(bf: Bifrost, local: MCPClient, since: datetime) -> list[str]:
     """The statuses of the local server's ``echo`` executions logged since ``since``, once
     the asynchronous log writer has had time to record one."""
     runs: list[str] = []
     for _ in range(int(SETTLE_SECONDS / POLL_SECONDS / 4)):
         logs = await bf.mcp_logs(since, limit=100)
-        runs = [log.status for log in logs if log.name == f"{local_mcp.CLIENT}-echo"]
+        runs = [log.status for log in logs if log.name == f"{local.config.name}-echo"]
         if runs:
             break
         await asyncio.sleep(POLL_SECONDS)
@@ -404,20 +443,20 @@ async def _echo_runs(bf: Bifrost, since: datetime) -> list[str]:
 
 
 async def test_a_completion_is_offered_no_gateway_tool_and_has_none_run(
-    admin: Admin, local: MCPClient, bf: Bifrost
+    admin: Admin, gateway: Gateway, local: MCPClient, bf: Bifrost
 ) -> None:
     """The guard, against the gateway that would otherwise do both: a key granted a server
     gets its tools added to a bare request (the prompt grows), and the gateway's agent loop
     runs a tool the client lists in ``tools_to_auto_execute`` when the model calls it."""
     model = _model()
-    echo = f"{local_mcp.CLIENT}-echo"
-    assert LIVE_URL is not None
+    echo = f"{local.config.name}-echo"
+    url = gateway.url
     async with (
         _key(admin, _granted(local)) as granted,
         _key(admin, []) as bare,
-        Bifrost(LIVE_URL, api_key=granted["value"], max_retries=0) as sdk,
-        Bifrost(LIVE_URL, api_key=bare["value"]) as nothing_to_add,
-        httpx.AsyncClient(base_url=LIVE_URL, timeout=120) as raw,
+        Bifrost(url, api_key=granted["value"], max_retries=0) as sdk,
+        Bifrost(url, api_key=bare["value"]) as nothing_to_add,
+        httpx.AsyncClient(base_url=url, timeout=120) as raw,
     ):
         body = {"model": model, "messages": [{"role": "user", "content": "say hi"}]}
         unguarded = await raw.post(
@@ -455,7 +494,7 @@ async def test_a_completion_is_offered_no_gateway_tool_and_has_none_run(
                 await sdk.complete(
                     ask, model=model, max_tokens=60, tools=declared, tool_choice="required"
                 )
-            assert "success" not in await _echo_runs(bf, since), "the gateway ran the tool"
+            assert "success" not in await _echo_runs(bf, local, since), "the gateway ran the tool"
 
             since = datetime.now(UTC) - timedelta(seconds=1)
             await raw.post(
@@ -464,6 +503,6 @@ async def test_a_completion_is_offered_no_gateway_tool_and_has_none_run(
                              "tools": declared, "tool_choice": "required"},
                 headers={"Authorization": f"Bearer {granted['value']}"},
             )  # fmt: skip
-            assert "success" in await _echo_runs(bf, since), "without the guard, it would"
+            assert "success" in await _echo_runs(bf, local, since), "without the guard, it would"
         finally:
             await bf.mcp.update(local, local.config)

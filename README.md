@@ -157,7 +157,7 @@ hierarchy, which method raises what, the retry policy and the breaker:
 ```bash
 make sync          # uv sync --all-extras
 make check         # lint, format-check, test, examples, links: what CI runs
-make test-live     # against a running gateway (below)
+make test-live     # against a real gateway and local MCP servers (below)
 ```
 
 The unit tests (`make test`) never touch the network: the gateway is an
@@ -165,28 +165,47 @@ The unit tests (`make test`) never touch the network: the gateway is an
 cover every line and branch of `src/`. CI (`.github/workflows/ci.yml`) runs `make check`'s
 steps on every pull request and on pushes to `main`.
 
-**Live tests.** `BIFROST_URL=http://localhost:8091/v1 make test-live` runs them against a
-running gateway.
+**Live tests.** `make test-live` (`pytest -m live`) runs them against a real gateway and real
+MCP servers, with no public host involved. The MCP servers are `tests/local_mcp.py`'s: three
+small streamable-HTTP servers the tests serve on free loopback ports for the session (a wiki
+server whose tools publish no annotations, one whose tools publish differing annotations, and
+an `echo`/`whoami` server that reads a forwarded caller header). Each test registers what it
+uses as a temporary MCP client, with a temporary virtual key where it needs one, and removes
+them afterwards.
 
-The live tests register temporary MCP clients (`BIFROST_LIVE_MCP_URL`, default the public
-DeepWiki server, which publishes no annotations; `BIFROST_LIVE_ANNOTATED_MCP_URL`, default the
-public Context7 server, which does) and remove them afterwards; they skip when `BIFROST_URL`
-is unset or the gateway is unreachable. `BIFROST_URL` is the name every repository in the
-platform uses for the gateway; the older `BIFROST_LIVE_URL` is still read when it is unset.
-A plain `uv run pytest` deselects them (`addopts` in `pyproject.toml`), because `BIFROST_URL`
-is often set in a shell that did not mean to register clients on that gateway.
+The gateway refuses to register a loopback server for an unauthenticated caller ("set an admin
+password to allow this"), so the tests register as the gateway's admin, as an operator would:
+dashboard auth on, `POST /api/session/login`, and the session token it returns as
+`admin_token=` / `Admin(token=)`. The simplest way is to let the tests start their own gateway
+(`tests/live_gateway.py`) from a local `bifrost-http` binary:
+
+```bash
+BIFROST_LIVE_GATEWAY_BIN=/path/to/bifrost-http \
+BIFROST_LIVE_GATEWAY_CONFIG=/path/to/config.json \
+BIFROST_LIVE_MODEL=provider/model \
+make test-live
+```
+
+It runs on a free `127.0.0.1` port with a new app directory (under `BIFROST_LIVE_GATEWAY_DIR`,
+else pytest's temporary directory; its output is `gateway.log` there), and stops when the
+session ends. Its `config.json` is `BIFROST_LIVE_GATEWAY_CONFIG`'s (your providers) with the
+test settings on top: SQLite stores in its app directory, dashboard auth with a random admin
+password, no MCP clients, logging on, and `enforce_auth_on_inference` off, because the MCP
+registry tests list and run tools as an unscoped caller (the key tests make their own keys).
+No other gateway is touched.
+
+Against a gateway that is already running, set `BIFROST_URL` (e.g.
+`http://localhost:8091/v1`) and, for the tests that register MCP servers,
+`BIFROST_LIVE_ADMIN_USERNAME` and `BIFROST_LIVE_ADMIN_PASSWORD` (they skip without). Every
+variable is in [docs/configuration.md](docs/configuration.md#the-live-tests-variables).
+
+The live tests skip when neither `BIFROST_LIVE_GATEWAY_BIN` nor `BIFROST_URL` is set, or the
+gateway is unreachable. `BIFROST_URL` is the name every repository in the platform uses for
+the gateway; the older `BIFROST_LIVE_URL` is still read when it is unset. A plain
+`uv run pytest` deselects them (`addopts` in `pyproject.toml`), because `BIFROST_URL` is often
+set in a shell that did not mean to register clients on that gateway.
 
 The live tests of prompts, skills, Virtual MCPs, per-user headers and the no-gateway-tools
 guarantee create and delete their own prompts, skills, Virtual MCPs and virtual keys. The
 ones that complete need `BIFROST_LIVE_MODEL` (`provider/model`, any model the gateway
-serves). The ones that run tools use `tests/local_mcp.py`, a small MCP server (streamable
-HTTP, on `127.0.0.1:8097`) that the tests start themselves. The gateway refuses to register a
-loopback server over an open management API, so it is declared in the gateway's
-`config.json` once, and the tests skip when it is not:
-
-```json
-"mcp": {"client_configs": [{
-  "name": "sdklocal", "connection_type": "http", "connection_string": "http://127.0.0.1:8097/mcp",
-  "auth_type": "none", "tools_to_execute": ["*"], "allowed_extra_headers": ["x-user-token"]
-}]}
-```
+serves).
