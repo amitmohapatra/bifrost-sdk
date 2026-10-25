@@ -8,11 +8,16 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # requires-python is ">=3.12": every supported minor version is proven, not just the oldest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           enable-cache: true
       # The dev tools are the `dev` extra, not a dependency group: --all-extras installs them.
       - run: uv sync --all-extras
