@@ -39,6 +39,7 @@ def client(handler) -> Bifrost:
     transport = httpx.MockTransport(handler)
     return Bifrost(
         BASE,
+        gateway="bifrost",
         model="test/model",
         client=httpx.AsyncClient(transport=transport, base_url=BASE),
         admin_client=httpx.AsyncClient(transport=transport, base_url="http://gateway.test"),
@@ -225,6 +226,7 @@ async def test_tools_are_the_virtual_keys_mcp_listing_never_the_admin_api() -> N
     transport = httpx.MockTransport(handler)
     bf = Bifrost(
         BASE,
+        gateway="bifrost",
         api_key="vk-1",
         client=httpx.AsyncClient(
             transport=transport, base_url=BASE, headers={"Authorization": "Bearer vk-1"}

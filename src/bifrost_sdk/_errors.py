@@ -131,6 +131,12 @@ class InvalidJSON(BifrostError):
     """``json()`` asked for structured output and could not parse what came back."""
 
 
+class BifrostOnlyError(BifrostError):
+    """A Bifrost-only method (MCP tools, ``mcp_logs``, ``bf.mcp``, ``options=``) was called on a
+    client built for another gateway. Nothing was sent; build the client with
+    ``gateway="bifrost"`` for a Bifrost gateway."""
+
+
 def unreachable(exc: httpx.TransportError) -> Unreachable:
     """A transport failure (connect, timeout, protocol) as this client's error."""
     return Unreachable(f"gateway unreachable ({type(exc).__name__})")

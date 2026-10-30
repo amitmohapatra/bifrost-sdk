@@ -8,6 +8,27 @@ raises what, is in [ARCHITECTURE.md](ARCHITECTURE.md#errors).
 **`ValueError: ... model ...` before anything is sent.** Neither the client (`model=`) nor
 the call names a model. Pass one, as the gateway names it: `provider/model`.
 
+**`BifrostOnlyError: ... is Bifrost's`.** `tools`, `execute_tool`, `mcp_logs`, `bf.mcp`,
+`options=`, `admin_token` or `admin_client` was used on a client built for another gateway
+(the default is `openai-compatible`). Nothing was sent. For a Bifrost gateway, build the
+client with `gateway="bifrost"`; for any other endpoint, drop the Bifrost-only call.
+
+**`BadRequestError` (400) naming `max_tokens` or `temperature`.** The model reasons (OpenAI's
+o-series, gpt-5) and refuses both. Pass `profile=ModelProfile(reasoning_output=True)` (or
+`temperature=False`): the budget goes as `max_completion_tokens` and no temperature is sent.
+
+**`ImportError: google auth needs the [google] extra`** (or `aws`). `GoogleAuth` and
+`AwsSigV4Auth` import google-auth and botocore when built: install `bifrost-sdk[google]` or
+`bifrost-sdk[aws]`.
+
+**`ValueError: aws auth needs a region`** or **`found no AWS credentials`.** botocore found
+no region (`AWS_DEFAULT_REGION`, the shared config) or no credentials. Pass
+`AwsSigV4Auth(region=..., credentials=...)`, or configure the AWS environment.
+
+**`ValueError: ... auth signs with its own credentials and takes no key`.** A key was given
+with `google` or `aws` auth (`auth_strategy("google", key)`). Those sign with Google or AWS
+credentials; unset the key.
+
 **`ValueError: a completion never carries the gateway's MCP tools`.** An `Options` with
 `mcp_clients` or `mcp_tools` was passed to `chat`, `json`, `stream` or `complete`. The MCP
 scope is for `execute_tool`. Offer tools to the model with `tools=` instead
@@ -89,8 +110,11 @@ only.
 
 ## FAQ
 
-**Does it read `BIFROST_URL`?** No. Your application does and passes it in
+**Does it read `LLM_BASE_URL`?** No. Your application does and passes it in
 ([configuration.md](configuration.md)). Only the live tests read it.
+
+**Does it work without Bifrost?** Yes. It is an OpenAI-compatible client: point `base_url` at
+any endpoint that speaks chat completions. Only the Bifrost extras need `gateway="bifrost"`.
 
 **Can I run the examples without a gateway?** Yes, `make examples` runs them against an
 in-process fake ([examples/](../examples/README.md)).

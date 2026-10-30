@@ -42,7 +42,7 @@ BASE = "http://gateway.test/v1"
 def client(handler, **kw) -> Bifrost:
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(transport=transport, base_url=BASE)
-    return Bifrost(BASE, model="test/model", client=http, **kw)
+    return Bifrost(BASE, model="test/model", client=http, **({"gateway": "bifrost"} | kw))
 
 
 def reply(content, *, finish="stop", usage=None):
@@ -324,7 +324,7 @@ async def test_no_deadline_leaves_the_client_default_in_place() -> None:
 
     transport = httpx.MockTransport(handler)
     http = httpx.AsyncClient(transport=transport, base_url=BASE, timeout=httpx.Timeout(9.0))
-    bf = Bifrost(BASE, model="test/model", client=http)
+    bf = Bifrost(BASE, gateway="bifrost", model="test/model", client=http)
     await bf.complete("ping")
     assert seen["timeout"] == {"connect": 9.0, "pool": 9.0, "read": 9.0, "write": 9.0}
     await bf.aclose()
@@ -623,6 +623,7 @@ async def test_a_long_rate_limit_body_still_yields_its_delay() -> None:
 
     client = Bifrost(
         "http://gateway/v1",
+        gateway="bifrost",
         model="provider/model",
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
@@ -670,6 +671,7 @@ async def test_ping_reports_a_gateway_we_can_actually_use(
 
     client = Bifrost(
         "http://gateway/v1",
+        gateway="bifrost",
         model="m",
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
@@ -687,6 +689,7 @@ async def test_an_unreachable_gateway_pings_false_rather_than_raising() -> None:
 
     client = Bifrost(
         "http://gateway/v1",
+        gateway="bifrost",
         model="m",
         client=httpx.AsyncClient(
             transport=httpx.MockTransport(handler), base_url="http://gateway/v1"
@@ -826,7 +829,7 @@ async def test_the_virtual_key_is_the_bearer_on_inference_and_mcp(
     listing = respx_mock.post("http://gateway.test/mcp").mock(
         return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
     )
-    bf = Bifrost("http://gateway.test/v1/", model="m", api_key=KEY)
+    bf = Bifrost("http://gateway.test/v1/", gateway="bifrost", model="m", api_key=KEY)
     assert await bf.chat("hi") == "ok"
     assert await bf.tools() == []
     for route in (chat, listing):
@@ -844,7 +847,9 @@ async def test_the_admin_token_replaces_the_key_on_api_routes_only(
     remove = respx_mock.delete("http://gateway.test/api/mcp/client/id-erp").mock(
         return_value=httpx.Response(200, json={})
     )
-    bf = Bifrost("http://gateway.test/v1", model="m", api_key=KEY, admin_token=ADMIN_TOKEN)
+    bf = Bifrost(
+        "http://gateway.test/v1", gateway="bifrost", model="m", api_key=KEY, admin_token=ADMIN_TOKEN
+    )
     await bf.chat("hi")
     await bf.mcp.remove("id-erp")
     assert chat.calls.last.request.headers["Authorization"] == f"Bearer {KEY}"
@@ -855,7 +860,7 @@ async def test_the_admin_token_replaces_the_key_on_api_routes_only(
 async def test_without_a_key_no_authorization_is_sent(respx_mock: respx.MockRouter) -> None:
     """A gateway with governance off takes anonymous calls; an empty bearer would be refused."""
     chat = respx_mock.post("http://gateway.test/v1/chat/completions").mock(return_value=reply("ok"))
-    async with Bifrost("http://gateway.test/v1", model="m") as bf:
+    async with Bifrost("http://gateway.test/v1", gateway="bifrost", model="m") as bf:
         await bf.chat("hi")
     assert "Authorization" not in chat.calls.last.request.headers
 
@@ -866,7 +871,7 @@ async def test_the_connect_timeout_is_capped_by_the_overall_one(
 ) -> None:
     """A gateway that does not accept a connection in five seconds is down; a client given
     less than that in total must not wait longer just to connect."""
-    async with Bifrost("http://gateway.test/v1", model="m", timeout=total) as bf:
+    async with Bifrost("http://gateway.test/v1", gateway="bifrost", model="m", timeout=total) as bf:
         for http in (bf._client, bf._admin):
             assert (http.timeout.read, http.timeout.connect) == (total, connect)
 
@@ -1501,7 +1506,7 @@ async def test_both_clients_pool_and_time_out_explicitly(monkeypatch: pytest.Mon
             super().__init__(**kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", Spy)
-    async with Bifrost(BASE, model="m", timeout=12.0):
+    async with Bifrost(BASE, gateway="bifrost", model="m", timeout=12.0):
         pass
     assert len(built) == 2
     for kwargs in built:

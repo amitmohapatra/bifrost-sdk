@@ -1,6 +1,7 @@
 # ADR 0003: A completion never gets the gateway's MCP tools
 
-**Status:** accepted · **Date:** 2026-10-05 (recorded 2026-10-06) · **Version:** 0.3.0
+**Status:** accepted · **Date:** 2026-10-05 (recorded 2026-10-06) · **Version:** 0.3.0 ·
+**Amended by:** [ADR 0004](0004-openai-compatible-with-bifrost-extras.md) (on a Bifrost gateway)
 
 ## Context
 A Bifrost virtual key with MCP access makes the gateway add the key's MCP tools to every

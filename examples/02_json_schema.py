@@ -28,7 +28,9 @@ INVOICE = {
 
 async def main() -> None:
     with FakeGateway() as gw:
-        async with Bifrost(f"{URL}/v1", model="provider/model", api_key=KEY) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", model="provider/model", api_key=KEY
+        ) as bf:
             data = await bf.json("Extract the invoice fields: ...", schema=INVOICE)
             print("parsed:", data)
             assert set(data) == set(INVOICE["required"])

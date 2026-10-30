@@ -1,13 +1,15 @@
 # API reference
 
 Every public method of `bifrost_sdk`, with its signature, what it sends and what it returns.
-There is no OpenAPI document here: this is a client, and the HTTP API it calls is the Bifrost
-gateway's own ([Bifrost](https://github.com/maximhq/bifrost)). Which method to use for which job is in
+There is no OpenAPI document here: this is a client, and the HTTP API it calls is OpenAI's chat
+completions, as any compatible endpoint serves it, plus a Bifrost gateway's own
+([Bifrost](https://github.com/maximhq/bifrost)) for the extras. Which method to use for which job is in
 the README's [Which method, when](../README.md#which-method-when). Errors, retries and the
 circuit breaker are in [ARCHITECTURE.md](ARCHITECTURE.md#errors). The constructor arguments
 are in [configuration.md](configuration.md).
 
 Contents: [the completion verbs](#the-completion-verbs) ·
+[auth strategies and profiles](#auth-strategies-and-profiles) ·
 [per-request options](#per-request-options) · [MCP tools](#mcp-tools) ·
 [managing MCP clients](#managing-mcp-clients) · [administration](#administration) ·
 [exports](#exports)
@@ -27,6 +29,9 @@ Contents: [the completion verbs](#the-completion-verbs) ·
 - `chat`, `json` and `stream` are opinionated: they always send a `max_tokens` and a
   `temperature` (`json` always `0.0`). `complete` is not — it sends only the keys you passed,
   because a caller building its own request should not find keys in the body it never set.
+  Under a profile that reasons or takes no temperature, the budget goes as
+  `max_completion_tokens` and no temperature is sent
+  ([auth strategies and profiles](#auth-strategies-and-profiles)).
 - `json(schema=...)` sends `response_format` as a strict `json_schema`; the reply is parsed
   defensively either way (code fences and surrounding prose are stripped) and anything that
   is not one JSON object raises `InvalidJSON`.
@@ -38,10 +43,38 @@ Contents: [the completion verbs](#the-completion-verbs) ·
 `ping()` says whether `GET /models` succeeds (any non-2xx, or no answer, is `False`), with a
 5-second timeout, and never raises.
 
+## Auth strategies and profiles
+
+`Bifrost(base_url, *, model=None, api_key=None, auth=None, gateway="openai-compatible",
+profile=None, ...)`: `auth` is any `httpx.Auth`, `api_key` a shorthand for `BearerAuth(api_key)`
+(not both). `bifrost_sdk.auth` holds the strategies, registered by name in
+`AUTH_STRATEGIES`:
+
+| Name | Class | Signature | What it sends |
+| --- | --- | --- | --- |
+| `bearer` | `BearerAuth` | `BearerAuth(api_key: str)` | `Authorization: Bearer <key>` |
+| `google` | `GoogleAuth` | `GoogleAuth(credentials=None, *, scopes=(CLOUD_PLATFORM,))` | a Google access token as the bearer, refreshed when it has expired (in a thread under asyncio); `credentials=None` is the application default. Needs `[google]` |
+| `aws` | `AwsSigV4Auth` | `AwsSigV4Auth(*, region=None, service="bedrock", credentials=None)` | a SigV4 signature over the host, content type and body (`Authorization`, `X-Amz-Date`, `X-Amz-Security-Token`); botocore's credentials and region by default. Needs `[aws]` |
+
+`auth_strategy(name, api_key=None) -> AuthStrategy` builds one by name, as a setting gives it
+(`LLM_AUTH`): the key is `bearer`'s, and `google` or `aws` given one raise `ValueError`, as
+does an unknown name. A strategy of your own subclasses `AuthStrategy` (an `httpx.Auth` with a
+`from_key(api_key)` classmethod) and is added to `AUTH_STRATEGIES`.
+
+`ModelProfile(reasoning_output=False, temperature=True)` says what the client's model
+accepts; the names are LangChain's model-profile keys (and `trellis.contracts.ModelProfile`'s:
+map one field by field). When `reasoning_output` is true or `temperature` false, every verb
+sends its budget as `max_completion_tokens` instead of `max_tokens` and sends no
+`temperature`, whatever the call passed. The model's name is never consulted.
+
+`gateway` is `"openai-compatible"` or `"bifrost"` (`GATEWAYS`, the `Gateway` literal). Only
+`"bifrost"` sends `x-bf-*` headers and allows the extras below; elsewhere they raise
+`BifrostOnlyError` before anything is sent.
+
 ## Per-request options
 
-Everything the gateway does for one call is selected by an `x-bf-*` header. Build an
-`Options` and pass it as `options=` to any verb (or to `execute_tool`):
+Bifrost only. Everything the gateway does for one call is selected by an `x-bf-*` header.
+Build an `Options` and pass it as `options=` to any verb (or to `execute_tool`):
 
 ```python
 from bifrost_sdk import Options
@@ -113,7 +146,8 @@ is given (an error turn through a slug, an error status through `/v1/mcp/tool/ex
 
 ## MCP tools
 
-Through this client the gateway neither adds MCP tools to a completion nor runs them (see
+Bifrost only (`gateway="bifrost"`). Through this client the gateway neither adds MCP tools to
+a completion nor runs them (see
 [Per-request options](#per-request-options)): the caller lists the tools, offers them as
 `tools=`, and runs the calls the model makes, so policy, audit and approval can sit in front
 of each call.
@@ -302,12 +336,17 @@ empty body (`204`) returns `None`; a `200` that is not JSON (the gateway's UI an
 
 ## Exports
 
-`bifrost_sdk.__all__`: `Bifrost`, `Messages`, `Options`, `NO_GATEWAY_TOOLS`, `RETRYABLE`;
-the MCP types `MCPClient`, `MCPClientConfig`, `MCPConnection`, `MCPLog`, `ToolDef`,
-`ToolAnnotations`; and the errors `BifrostError`, `Unreachable`, `RateLimited`,
-`RateLimitedError`, `GatewayError`, `BadRequestError`, `AuthenticationError`,
-`PermissionDeniedError`, `NotFoundError`, `ConflictError`, `UnprocessableError`,
-`ServerError`, `CircuitOpen`, `EmptyResponse`, `InvalidJSON`.
+`bifrost_sdk.__all__`: `Bifrost`, `Messages`, `Gateway`, `GATEWAYS`, `ModelProfile`,
+`Options`, `NO_GATEWAY_TOOLS`, `RETRYABLE`; the auth strategies `AuthStrategy`, `BearerAuth`,
+`GoogleAuth`, `AwsSigV4Auth`, `AUTH_STRATEGIES`, `auth_strategy`; the MCP types `MCPClient`,
+`MCPClientConfig`, `MCPConnection`, `MCPLog`, `ToolDef`, `ToolAnnotations`; and the errors
+`BifrostError`, `Unreachable`, `RateLimited`, `RateLimitedError`, `GatewayError`,
+`BadRequestError`, `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`,
+`ConflictError`, `UnprocessableError`, `ServerError`, `CircuitOpen`, `EmptyResponse`,
+`InvalidJSON`, `BifrostOnlyError`.
+
+`bifrost_sdk.auth` also holds `CLOUD_PLATFORM` (the Google scope) and `BEDROCK` (the SigV4
+service name).
 
 `bifrost_sdk.headers` holds `Options`, `NO_GATEWAY_TOOLS` and every `x-bf-*` header name as
 a constant. `bifrost_sdk.admin` holds `Admin`, its namespaces (`VirtualKeys`, `Governance`,

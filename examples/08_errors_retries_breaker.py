@@ -20,6 +20,7 @@ async def main() -> None:
             f"{URL}/v1",
             model="provider/model",
             api_key=KEY,
+            gateway="bifrost",
             max_retries=2,
             backoff_seconds=0.01,  # tiny, so the example is quick
             circuit_failure_threshold=2,

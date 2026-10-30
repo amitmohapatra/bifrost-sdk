@@ -1,7 +1,7 @@
 [project]
 name = "bifrost-sdk"
-version = "0.3.0"
-description = "A small client for a Bifrost LLM gateway."
+version = "0.4.0"
+description = "An OpenAI-compatible async client, with Bifrost extras."
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
@@ -9,6 +9,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Auth strategies beyond a bearer key, each imported only when it is built (bifrost_sdk.auth).
+google = ["google-auth[requests]>=2.30"]
+aws = ["botocore>=1.34"]
 dev = ["mcp>=2.2", "pytest>=8", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6"]
 
 [build-system]
@@ -28,11 +31,11 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PL", "RUF", "ASYNC"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# The live tests register MCP clients and virtual keys on whatever gateway BIFROST_URL names,
+# The live tests register MCP clients and virtual keys on whatever gateway LLM_BASE_URL names,
 # and that variable is set in shells that never meant to: they run only when asked for, with
 # `-m live` (a later -m replaces this one).
 addopts = ["-m", "not live"]
-markers = ["live: needs a running gateway (BIFROST_URL, or BIFROST_LIVE_URL); run with -m live"]
+markers = ["live: needs a running gateway (LLM_BASE_URL) or a provider key; run with -m live"]
 
 [tool.ruff.lint.per-file-ignores]
 # PLR0913: the three verbs take many *keyword-only* arguments on purpose — that is the

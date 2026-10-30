@@ -1,5 +1,5 @@
 """The gateway the live tests run against: one they start themselves, or the one
-``BIFROST_URL`` names.
+``LLM_BASE_URL`` names.
 
 The gateway refuses to register a loopback, private-network or link-local MCP server for an
 unauthenticated caller ("set an admin password to allow this"), and the live tests register
@@ -160,8 +160,8 @@ def from_environment(scratch: Path) -> contextlib.AbstractContextManager[Gateway
 
     ``BIFROST_LIVE_GATEWAY_BIN`` starts one (its base ``config.json`` from
     ``BIFROST_LIVE_GATEWAY_CONFIG``; its app directory a new one under
-    ``BIFROST_LIVE_GATEWAY_DIR``, else ``scratch``). Otherwise ``BIFROST_URL`` (or
-    ``BIFROST_LIVE_URL``) names a running one, and ``BIFROST_LIVE_ADMIN_USERNAME`` /
+    ``BIFROST_LIVE_GATEWAY_DIR``, else ``scratch``). Otherwise ``LLM_BASE_URL`` names a running
+    one, and ``BIFROST_LIVE_ADMIN_USERNAME`` /
     ``BIFROST_LIVE_ADMIN_PASSWORD`` its admin.
     """
     env = os.environ
@@ -171,7 +171,7 @@ def from_environment(scratch: Path) -> contextlib.AbstractContextManager[Gateway
         parent.mkdir(parents=True, exist_ok=True)
         app_dir = Path(tempfile.mkdtemp(prefix="bifrost-live-", dir=parent))
         return started(Path(binary), Path(base) if base else None, app_dir)
-    url = env.get("BIFROST_URL") or env.get("BIFROST_LIVE_URL")
+    url = env.get("LLM_BASE_URL")
     if not url:
         return None
     gateway = existing(
