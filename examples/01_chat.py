@@ -18,7 +18,7 @@ MODEL = "provider/model"  # as the gateway names it
 
 async def main() -> None:
     with FakeGateway() as gw:
-        async with Bifrost(f"{URL}/v1", model=MODEL, api_key=KEY) as bf:
+        async with Bifrost(f"{URL}/v1", gateway="bifrost", model=MODEL, api_key=KEY) as bf:
             assert await bf.ping()  # GET /v1/models answered 2xx
 
             options = Options(session_id="chat-42", customer_id="acme", content_logging=False)

@@ -26,6 +26,30 @@ go with which is in [docs/versioning.md](docs/versioning.md); the reasons are in
   a `Makefile` with the targets CI runs, and a link check; CI runs the examples and the link
   check.
 
+## 0.4.0 (2026-10-30)
+
+An OpenAI-compatible client, with Bifrost extras
+([ADR 0004](docs/adr/0004-openai-compatible-with-bifrost-extras.md)).
+
+* **Any OpenAI-compatible endpoint.** `Bifrost(gateway=)` is `"openai-compatible"` (the
+  default) or `"bifrost"`. Only a Bifrost client sends `x-bf-*` headers (the deny-all MCP scope
+  included); elsewhere `tools`, `execute_tool`, `mcp_logs`, `bf.mcp`, `options=` and
+  `admin_token`/`admin_client` raise the new `BifrostOnlyError` before sending anything.
+  **Breaking:** a client for a Bifrost gateway now passes `gateway="bifrost"`.
+* **Auth strategies** (`bifrost_sdk.auth`), each an `httpx.Auth`, registered by name in
+  `AUTH_STRATEGIES` and built with `auth_strategy(name, api_key)`: `BearerAuth` (what
+  `api_key=` sends), `GoogleAuth` (a refreshed Google token; extra `[google]`) and
+  `AwsSigV4Auth` (SigV4, body signed; extra `[aws]`). `Bifrost(auth=)` takes any `httpx.Auth`.
+* **Requests shaped from a `ModelProfile`** (`reasoning_output`, `temperature`, LangChain's
+  keys): a model that reasons or takes no temperature is sent `max_completion_tokens` and no
+  `temperature`. No model-name checks.
+* A conformance suite runs every gateway, auth strategy and profile against stubs of OpenAI,
+  the Anthropic and Gemini compatible endpoints and Bifrost, with a Google token refresh and a
+  SigV4 signature recomputed from the specification. Opt-in live smoke tests per provider,
+  collected only when its key is set. Example 09.
+* The live tests read `LLM_BASE_URL` (was `BIFROST_URL`); `BIFROST_LIVE_URL` is no longer
+  read. The docs use the platform's `LLM_*` names.
+
 ## 0.3.0 (2026-10-05)
 
 * **Completions never get the gateway's MCP tools.** `chat`, `json`, `stream` and `complete`

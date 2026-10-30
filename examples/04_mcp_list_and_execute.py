@@ -24,7 +24,9 @@ def allowed(call: dict) -> bool:
 
 async def main() -> None:
     with FakeGateway():
-        async with Bifrost(f"{URL}/v1", model="provider/model", api_key=KEY) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", model="provider/model", api_key=KEY
+        ) as bf:
             tools = await bf.tools(clients=["erp"], only=["erp-get_stock"])
             for tool in await bf.tools():
                 hints = tool.annotations

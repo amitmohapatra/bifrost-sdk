@@ -1,8 +1,9 @@
 # Examples
 
-Eight scripts, simplest first. Each runs **offline**: the real `bifrost_sdk` client talks to
+Nine scripts, simplest first. Each runs **offline**: the real `bifrost_sdk` client talks to
 `http://gateway.test`, and [`_fake_gateway.py`](_fake_gateway.py) answers those requests
-in-process with `respx`, in the shapes a running gateway sends. No network, no key, no
+in-process with `respx`, in the shapes a running Bifrost gateway sends (09 talks to a plain
+OpenAI-compatible stub instead). No network, no key, no
 environment variable. Each script asserts what it shows, so exit 0 is a passing check.
 
 ```bash
@@ -22,8 +23,10 @@ They need the dev extras (`make sync`), which include `respx`.
 | 06 | [06_prompts_and_skills.py](06_prompts_and_skills.py) | `admin.prompts` create, commit, find; `Options(prompt_id=, prompt_version=)`; `admin.skills` create, find, `read_file` | [Stored prompts and skills](../docs/ARCHITECTURE.md#stored-prompts-and-skills) |
 | 07 | [07_admin_mcp_clients_and_keys.py](07_admin_mcp_clients_and_keys.py) | `bf.mcp.add`, `clients`, `remove`; `admin.vk.create` with explicit provider and MCP configs | [api.md: administration](../docs/api.md#administration) |
 | 08 | [08_errors_retries_breaker.py](08_errors_retries_breaker.py) | a 503 retried, a 429's own delay, `ServerError.retryable`, the breaker opening, `CircuitOpen` with nothing sent | [Errors](../docs/ARCHITECTURE.md#errors), [the circuit breaker](../docs/ARCHITECTURE.md#the-circuit-breaker) |
+| 09 | [09_any_openai_compatible_endpoint.py](09_any_openai_compatible_endpoint.py) | any OpenAI-compatible endpoint: `auth_strategy` by name, a reasoning model's `ModelProfile` (`max_completion_tokens`, no `temperature`), no `x-bf-*` header, `BifrostOnlyError` unsent | [api.md: auth strategies and profiles](../docs/api.md#auth-strategies-and-profiles) |
 
 **Against a real gateway.** Drop the `with FakeGateway()` block and pass your gateway's `/v1`
-URL and a virtual key from your own settings. The tool names (`erp-get_stock`, ...) are the
+URL and a virtual key from your own settings (09: drop `respx` and pass any endpoint's URL and
+key). The tool names (`erp-get_stock`, ...) are the
 fake's; use the ones `tools()` lists for your key. The live test suite (`make test-live`)
 covers the same calls against a running gateway.

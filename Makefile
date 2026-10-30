@@ -13,7 +13,7 @@ format-check:
 test:  ## unit tests: the gateway is mocked, nothing touches the network
 	uv run pytest -q
 
-test-live:  ## against a running gateway: BIFROST_URL (see README, Development)
+test-live:  ## against a running gateway (LLM_BASE_URL) and providers whose keys are set (README)
 	uv run pytest -q -m live
 
 examples:  ## run every numbered example against the in-process fake gateway (offline)

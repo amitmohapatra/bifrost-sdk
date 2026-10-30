@@ -1,4 +1,4 @@
-"""A small client for a Bifrost LLM gateway.
+"""An OpenAI-compatible async client, with Bifrost extras.
 
 Three verbs, because there are three things callers do::
 
@@ -11,9 +11,13 @@ Three verbs, because there are three things callers do::
 ...and ``complete()`` when you need the gateway's whole response — usage, tool calls, finish
 reason — rather than the part of it the three verbs keep.
 
-The gateway holds the provider keys, so this client knows a URL and a model *name* and never
-a provider credential. No provider SDK is imported here, which is what lets the same code run
-against OpenAI, Anthropic or a local model by changing a string.
+Any endpoint that speaks OpenAI's chat completions is served: OpenAI, OpenRouter, a LiteLLM
+proxy, Ollama, vLLM, llama.cpp, the Anthropic and Gemini compatible endpoints, Bifrost. How a
+request is authenticated is an ``httpx.Auth`` (:mod:`bifrost_sdk.auth`), and what the model
+accepts is a :class:`ModelProfile`. Built with ``gateway="bifrost"``, the client also has
+Bifrost's extras: MCP tools, their log, the MCP clients and per-request ``x-bf-*`` options.
+No provider SDK is imported here, which is what lets the same code run against any of them by
+changing a string.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ import random
 import re
 from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal, get_args
 from urllib.parse import quote
 
 import httpx
@@ -33,6 +37,7 @@ from bifrost_sdk._api import ManagementAPI, limits, management_client, origin, t
 from bifrost_sdk._breaker import Breaker
 from bifrost_sdk._errors import (
     ERROR_STATUS,
+    BifrostOnlyError,
     EmptyResponse,
     GatewayError,
     InvalidJSON,
@@ -50,11 +55,19 @@ from bifrost_sdk._mcp import (
     scope,
     server_files,
 )
+from bifrost_sdk._profile import ModelProfile
 from bifrost_sdk._retry import MAX_WAIT, RETRYABLE, Jitter, backoff
+from bifrost_sdk.auth import BearerAuth
 from bifrost_sdk.headers import NO_GATEWAY_TOOLS, Options
 
 #: A message is ``{"role": ..., "content": ...}``; a bare string is shorthand for one user turn.
 Messages = str | Sequence[dict[str, Any]]
+
+#: What the client is pointed at: any OpenAI-compatible endpoint, or a Bifrost gateway, whose
+#: extras (MCP tools, their log, ``bf.mcp``, ``options=``) only the latter has.
+Gateway = Literal["openai-compatible", "bifrost"]
+#: Every :data:`Gateway`.
+GATEWAYS: tuple[Gateway, ...] = get_args(Gateway)
 
 #: The gateway's maximum page size for ``GET /api/mcp-logs``.
 MAX_LOG_PAGE = 1000
@@ -72,25 +85,20 @@ def _messages(prompt: Messages, system: str | None) -> list[dict[str, Any]]:
     return [{"role": "system", "content": system}, *turns] if system else turns
 
 
-def _completion_headers(options: Options | None) -> dict[str, str]:
-    """A completion's ``x-bf-*`` headers: ``options``, and never the gateway's MCP tools."""
-    if options is not None and (options.mcp_clients or options.mcp_tools):
-        raise ValueError(
-            "a completion never carries the gateway's MCP tools: mcp_clients/mcp_tools scope "
-            "execute_tool(); pass the tools to offer as tools="
-        )
-    return (options.headers() if options is not None else {}) | NO_GATEWAY_TOOLS
-
-
 class Bifrost:
-    """One gateway, one default model, three verbs.
+    """One endpoint, one default model, three verbs.
 
-    Every verb takes ``options=`` (:class:`~bifrost_sdk.headers.Options`) for per-request
-    gateway behaviour, and never lets the gateway add or run MCP tools
-    (:data:`NO_GATEWAY_TOOLS`): a model is offered the tools passed as ``tools=``, no others.
-    Everything below the public methods exists because a real gateway did it to us: rate
-    limits that carry their delay in the body, reasoning models that answer with nothing,
-    and a circuit breaker that must not confuse "slow down" with "broken".
+    ``auth`` authenticates every request (an ``httpx.Auth``: :mod:`bifrost_sdk.auth`);
+    ``api_key`` is shorthand for a :class:`~bifrost_sdk.auth.BearerAuth`. ``profile`` says what
+    the default model accepts, and shapes every request body from that
+    (:class:`ModelProfile`). With ``gateway="bifrost"`` every verb takes ``options=``
+    (:class:`~bifrost_sdk.headers.Options`) for per-request gateway behaviour, and never lets
+    the gateway add or run MCP tools (:data:`NO_GATEWAY_TOOLS`): a model is offered the tools
+    passed as ``tools=``, no others. On any other gateway the Bifrost-only methods raise
+    :class:`BifrostOnlyError` before sending anything. Everything below the public methods
+    exists because a real gateway did it to us: rate limits that carry their delay in the
+    body, reasoning models that answer with nothing, and a circuit breaker that must not
+    confuse "slow down" with "broken".
     """
 
     def __init__(
@@ -99,6 +107,9 @@ class Bifrost:
         *,
         model: str | None = None,
         api_key: str | None = None,
+        auth: httpx.Auth | None = None,
+        gateway: Gateway = "openai-compatible",
+        profile: ModelProfile | None = None,
         timeout: float = 60.0,
         max_retries: int = 2,
         backoff_seconds: float = 0.5,
@@ -110,12 +121,20 @@ class Bifrost:
         admin_client: httpx.AsyncClient | None = None,
     ) -> None:
         if not base_url:
-            raise ValueError("base_url is required (the gateway's /v1 endpoint)")
+            raise ValueError("base_url is required (the endpoint's /v1 root)")
+        if gateway not in GATEWAYS:
+            raise ValueError(f"unknown gateway {gateway!r}; known: {', '.join(GATEWAYS)}")
+        if api_key and auth is not None:
+            raise ValueError("pass api_key (a bearer key) or auth=, not both")
+        if gateway != "bifrost" and (admin_token or admin_client):
+            raise BifrostOnlyError("admin_token and admin_client are Bifrost's: gateway='bifrost'")
         if max_retries < 0:
             # Zero attempts would fail every call without sending it, as a "request failed"
             # that counts toward the breaker.
             raise ValueError("max_retries must be 0 or more")
         self.model = model
+        self.gateway = gateway
+        self.profile = profile or ModelProfile()
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
@@ -126,24 +145,32 @@ class Bifrost:
         #: outage costs one full timeout *per request* — with it, one in total. Pass
         #: ``circuit_failure_threshold=0`` to turn it off and see every failure yourself.
         self._breaker = Breaker(circuit_failure_threshold, circuit_open_seconds)
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            # A gateway virtual key, never a provider key: the provider's credential stays in
-            # the gateway, which is the whole reason for having one.
-            headers["Authorization"] = f"Bearer {api_key}"
         self._client = client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers=headers,
+            headers={"Content-Type": "application/json"},
+            auth=auth or (BearerAuth(api_key) if api_key else None),
             timeout=timeouts(timeout),
             limits=limits(),
         )
         self._owns_client = client is None
-        #: ``/api/*`` (MCP listing, logs, client CRUD) authenticates with a bearer token,
-        #: defaulting to the virtual key.
-        self._admin = admin_client or management_client(base_url, admin_token or api_key, timeout)
+        self._admin: httpx.AsyncClient | None = None
+        self._api: ManagementAPI | None = None
+        self._mcp: MCP | None = None
+        if gateway == "bifrost":
+            #: ``/api/*`` (MCP listing, logs, client CRUD) authenticates with a bearer token,
+            #: defaulting to the virtual key.
+            token = admin_token or api_key
+            self._admin = admin_client or management_client(base_url, token, timeout)
+            self._api = ManagementAPI(self._admin)
+            self._mcp = MCP(self._api)
         self._owns_admin = admin_client is None
-        self._api = ManagementAPI(self._admin)
-        self.mcp = MCP(self._api)
+
+    @property
+    def mcp(self) -> MCP:
+        """The gateway's MCP clients (list, add, update, remove). Bifrost only."""
+        if self._mcp is None:
+            raise self._not_bifrost("bf.mcp")
+        return self._mcp
 
     # ----------------------------------------------------------------- the three verbs
 
@@ -234,7 +261,7 @@ class Bifrost:
             tools=tools,
             extra=extra,
         ) | {"stream": True}
-        headers = _completion_headers(options)
+        headers = self._completion_headers(options)
         self._breaker.check()
         try:
             async with self._client.stream(
@@ -324,6 +351,7 @@ class Bifrost:
         meta-tools are): they are read from the meta-tools' declarations instead, marked
         ``code_mode``, with signature-derived ``parameters`` and no ``annotations``.
         """
+        self._bifrost("tools()")
         admits = scope(clients, only)
         return [tool for tool in await self._listed_tools(_endpoint(slug)) if admits(tool)]
 
@@ -398,6 +426,7 @@ class Bifrost:
         Logs are written asynchronously (a few seconds behind), and ``since`` is inclusive:
         a caller paging forward dedups by :attr:`MCPLog.id`.
         """
+        api = self._bifrost("mcp_logs()")
         if since.tzinfo is None:
             raise ValueError("since must be timezone-aware")
         if not 1 <= limit <= MAX_LOG_PAGE:
@@ -410,7 +439,7 @@ class Bifrost:
         }
         if parent_request_id is not None:
             params["llm_request_ids"] = parent_request_id
-        entries = await self._api.items("/api/mcp-logs", ("logs",), **params)
+        entries = await api.items("/api/mcp-logs", ("logs",), **params)
         return [MCPLog._from_gateway(entry) for entry in entries]
 
     async def execute_tool(
@@ -435,6 +464,7 @@ class Bifrost:
         tools are permitted. Not retried and not counted by the breaker: a tool may have side
         effects, and a refused call is a 400 (an error turn through a slug).
         """
+        self._bifrost("execute_tool()")
         function = tool_call.get("function") or {}
         if not function.get("name"):
             raise ValueError("tool_call has no function name")
@@ -482,7 +512,7 @@ class Bifrost:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
-        if self._owns_admin:
+        if self._owns_admin and self._admin is not None:
             await self._admin.aclose()
 
     async def __aenter__(self) -> Bifrost:
@@ -492,6 +522,32 @@ class Bifrost:
         await self.aclose()
 
     # ----------------------------------------------------------------- internals
+
+    def _bifrost(self, what: str) -> ManagementAPI:
+        """The gateway's management API; :class:`BifrostOnlyError` on any other gateway."""
+        if self._api is None:
+            raise self._not_bifrost(what)
+        return self._api
+
+    def _not_bifrost(self, what: str) -> BifrostOnlyError:
+        return BifrostOnlyError(
+            f"{what} is Bifrost's, and this client was built for gateway={self.gateway!r}: "
+            "build it with gateway='bifrost' for a Bifrost gateway"
+        )
+
+    def _completion_headers(self, options: Options | None) -> dict[str, str]:
+        """A completion's headers. On Bifrost, ``options`` and never the gateway's MCP tools;
+        elsewhere none, and ``options`` (``x-bf-*`` headers) are refused."""
+        if self.gateway != "bifrost":
+            if options is not None:
+                raise self._not_bifrost("options=")
+            return {}
+        if options is not None and (options.mcp_clients or options.mcp_tools):
+            raise ValueError(
+                "a completion never carries the gateway's MCP tools: mcp_clients/mcp_tools "
+                "scope execute_tool(); pass the tools to offer as tools="
+            )
+        return (options.headers() if options is not None else {}) | NO_GATEWAY_TOOLS
 
     def _body(
         self,
@@ -509,14 +565,19 @@ class Bifrost:
         The verbs supply their own defaults before calling in, so they always send a
         ``max_tokens`` and a ``temperature``. ``complete()`` does not: a caller reaching for
         the raw payload is building its own request, and having a key appear that it never
-        asked for is the kind of surprise a gateway charges for.
+        asked for is the kind of surprise a gateway charges for. The profile decides the
+        shape: a model that reasons or takes no temperature gets the budget as
+        ``max_completion_tokens`` and no ``temperature`` (:class:`ModelProfile`).
         """
         chosen = model or self.model
         if not chosen:
             raise ValueError("no model: pass model= here or set it on the client")
         body: dict[str, Any] = {"model": chosen, "messages": _messages(prompt, system)}
+        budget = "max_tokens"
+        if self.profile.fixed_sampling:
+            budget, temperature = "max_completion_tokens", None
         if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+            body[budget] = max_tokens
         if temperature is not None:
             body["temperature"] = temperature
         body.update(extra or {})
@@ -533,7 +594,7 @@ class Bifrost:
     ) -> dict[str, Any]:
         # httpx reads an explicit timeout=None as "wait forever", so the argument is omitted
         # rather than passed through when the caller has no deadline of their own.
-        request: dict[str, Any] = {"json": body, "headers": _completion_headers(options)}
+        request: dict[str, Any] = {"json": body, "headers": self._completion_headers(options)}
         if timeout is not None:
             request["timeout"] = timeout
         self._breaker.check()
@@ -664,4 +725,4 @@ def _delta(data: str) -> str:
     return str(delta.get("content") or "") if isinstance(delta, dict) else ""
 
 
-__all__ = ["Bifrost", "Messages"]
+__all__ = ["GATEWAYS", "Bifrost", "Gateway", "Messages"]

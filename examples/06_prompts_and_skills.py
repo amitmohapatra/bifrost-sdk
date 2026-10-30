@@ -42,7 +42,9 @@ async def main() -> None:
             resolved = await admin.prompts.find("triage")  # names to ids, once
             assert resolved is not None
 
-        async with Bifrost(f"{URL}/v1", model="provider/model", api_key=KEY) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", model="provider/model", api_key=KEY
+        ) as bf:
             options = Options(prompt_id=resolved.id, prompt_version=v1.number)
             print("with the stored prompt:", await bf.chat("Printer on fire", options=options))
 

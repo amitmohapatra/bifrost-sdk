@@ -3,10 +3,9 @@
 The gateway is one the tests start (``BIFROST_LIVE_GATEWAY_BIN``, a ``bifrost-http`` binary:
 ``live_gateway.py`` runs it on a free port with its own app directory, dashboard auth on and a
 test ``config.json`` derived from ``BIFROST_LIVE_GATEWAY_CONFIG``, and stops it afterwards), or
-the running one ``BIFROST_URL`` names (``BIFROST_LIVE_URL`` is still read when it is unset) —
-the tests skip when neither is set or the gateway is unreachable. Deselected by a plain
-``pytest`` (``addopts`` in ``pyproject.toml``): ``BIFROST_URL`` is set in shells that never
-meant to register clients on that gateway.
+the running one ``LLM_BASE_URL`` names — the tests skip when neither is set or the gateway is
+unreachable. Deselected by a plain ``pytest`` (``addopts`` in ``pyproject.toml``):
+``LLM_BASE_URL`` is set in shells that never meant to register clients on that gateway.
 
 The MCP servers are ``local_mcp.py``'s, served on free loopback ports for the session. The
 tests register them as temporary MCP clients and remove them afterwards. The gateway refuses
@@ -75,7 +74,7 @@ def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
     """The gateway for the session: started (and stopped) here, or an existing one."""
     chosen = live_gateway.from_environment(tmp_path_factory.mktemp("gateway"))
     if chosen is None:
-        pytest.skip("neither BIFROST_LIVE_GATEWAY_BIN nor BIFROST_URL (BIFROST_LIVE_URL) set")
+        pytest.skip("neither BIFROST_LIVE_GATEWAY_BIN nor LLM_BASE_URL set")
     with chosen as running:
         yield running
 
@@ -90,7 +89,7 @@ def servers() -> Iterator[local_mcp.Servers]:
 @pytest.fixture
 async def bf(gateway: Gateway) -> AsyncIterator[Bifrost]:
     """An unscoped caller (no virtual key) with the gateway's admin token for ``/api/*``."""
-    client = Bifrost(gateway.url, admin_token=gateway.admin_token)
+    client = Bifrost(gateway.url, gateway="bifrost", admin_token=gateway.admin_token)
     if not await client.ping():
         await client.aclose()
         pytest.skip(f"no gateway at {gateway.url}")
@@ -250,7 +249,7 @@ async def test_a_virtual_key_lists_only_the_tools_it_allows(
         )
         key = created["virtual_key"]
         try:
-            async with Bifrost(gateway.url, api_key=key["value"]) as scoped:
+            async with Bifrost(gateway.url, gateway="bifrost", api_key=key["value"]) as scoped:
                 assert [t.name for t in await scoped.tools()] == [f"{name}-{TOOL}"]
         finally:
             await admin.vk.delete(key["id"])
@@ -323,7 +322,10 @@ async def test_a_prompt_is_committed_resolved_and_applied(admin: Admin, gateway:
         assert [v.number for v in await admin.prompts.versions(prompt.id)] == [1]
         assert await admin.prompts.version(version.id) == version
 
-        async with _key(admin, []) as key, Bifrost(gateway.url, api_key=key["value"]) as bf:
+        async with (
+            _key(admin, []) as key,
+            Bifrost(gateway.url, gateway="bifrost", api_key=key["value"]) as bf,
+        ):
             question = "What is 2 + 2?"
             turns = [system, {"role": "user", "content": question}]
             sent = await bf.complete(turns, model=model, max_tokens=20)
@@ -386,7 +388,10 @@ async def test_a_callers_header_reaches_the_mcp_server_as_theirs(
     through ``/v1/mcp/tool/execute`` and through the client's own ``/mcp/<slug>``."""
     assert local.config.allowed_extra_headers == (local_mcp.USER_HEADER,)
     url = gateway.url
-    async with _key(admin, _granted(local)) as key, Bifrost(url, api_key=key["value"]) as bf:
+    async with (
+        _key(admin, _granted(local)) as key,
+        Bifrost(url, gateway="bifrost", api_key=key["value"]) as bf,
+    ):
         for user in ("alice", "bob"):
             options = Options(extra={local_mcp.USER_HEADER: user})
             for slug in (None, local.config.name):
@@ -405,7 +410,10 @@ async def test_a_virtual_mcp_scopes_what_a_key_lists_and_runs(
     try:
         assert vmcp.tools == {local.id: ("echo",)}
         assert vmcp.enabled and vmcp.virtual_key_ids == ()
-        async with _key(admin, []) as key, Bifrost(gateway.url, api_key=key["value"]) as bf:
+        async with (
+            _key(admin, []) as key,
+            Bifrost(gateway.url, gateway="bifrost", api_key=key["value"]) as bf,
+        ):
             with pytest.raises(PermissionDeniedError):
                 await bf.tools(slug=vmcp.slug)
             await admin.virtual_mcps.attach(vmcp.id, key["id"])
@@ -454,8 +462,8 @@ async def test_a_completion_is_offered_no_gateway_tool_and_has_none_run(
     async with (
         _key(admin, _granted(local)) as granted,
         _key(admin, []) as bare,
-        Bifrost(url, api_key=granted["value"], max_retries=0) as sdk,
-        Bifrost(url, api_key=bare["value"]) as nothing_to_add,
+        Bifrost(url, gateway="bifrost", api_key=granted["value"], max_retries=0) as sdk,
+        Bifrost(url, gateway="bifrost", api_key=bare["value"]) as nothing_to_add,
         httpx.AsyncClient(base_url=url, timeout=120) as raw,
     ):
         body = {"model": model, "messages": [{"role": "user", "content": "say hi"}]}

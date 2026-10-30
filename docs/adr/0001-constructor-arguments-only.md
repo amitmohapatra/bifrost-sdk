@@ -1,6 +1,7 @@
 # ADR 0001: Constructor arguments only; the gateway holds the credentials
 
-**Status:** accepted · **Date:** 2026-09-21 (recorded 2026-10-06) · **Version:** 0.1.0
+**Status:** accepted · **Date:** 2026-09-21 (recorded 2026-10-06) · **Version:** 0.1.0 ·
+**Amended by:** [ADR 0004](0004-openai-compatible-with-bifrost-extras.md)
 
 ## Context
 The SDK is imported by services that each have their own configuration story: the harness

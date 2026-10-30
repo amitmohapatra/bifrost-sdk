@@ -26,7 +26,9 @@ async def main() -> None:
             print("created Virtual MCP:", bundle.slug)
             await admin.virtual_mcps.attach(bundle.id, KEY_ID)  # reachable from now on
 
-        async with Bifrost(f"{URL}/v1", model="provider/model", api_key=KEY) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", model="provider/model", api_key=KEY
+        ) as bf:
             listed = [t.name for t in await bf.tools(slug=bundle.slug)]
             print("through the slug:", listed)
             assert "erp-create_po" not in listed

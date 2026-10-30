@@ -15,7 +15,9 @@ from bifrost_sdk import Bifrost
 
 async def main() -> None:
     with FakeGateway():
-        async with Bifrost(f"{URL}/v1", model="provider/model", api_key=KEY) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", model="provider/model", api_key=KEY
+        ) as bf:
             deltas = []
             async for delta in bf.stream("a dragon who audits invoices"):
                 deltas.append(delta)

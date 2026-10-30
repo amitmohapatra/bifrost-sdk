@@ -17,7 +17,9 @@ from bifrost_sdk.admin import Admin
 
 async def main() -> None:
     with FakeGateway():
-        async with Bifrost(f"{URL}/v1", api_key=KEY, admin_token=ADMIN_TOKEN) as bf:
+        async with Bifrost(
+            f"{URL}/v1", gateway="bifrost", api_key=KEY, admin_token=ADMIN_TOKEN
+        ) as bf:
             config = MCPClientConfig(
                 name="docs",  # no "-": it separates client from tool in every tool name
                 connection=MCPConnection(type="http", url="https://docs.example.com/mcp"),

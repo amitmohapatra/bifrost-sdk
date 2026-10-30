@@ -1,7 +1,9 @@
 # Configuration
 
 `bifrost-sdk` reads **no environment variable and no file**
-([ADR 0001](adr/0001-constructor-arguments-only.md)). Every setting is a constructor argument,
+([ADR 0001](adr/0001-constructor-arguments-only.md)); google-auth and botocore find their own
+credentials when a `GoogleAuth` or `AwsSigV4Auth` is built without any
+([ADR 0004](adr/0004-openai-compatible-with-bifrost-extras.md)). Every setting is a constructor argument,
 so the application decides where values come from. "Automatic?" says whether you get the
 behaviour without passing anything.
 
@@ -13,7 +15,8 @@ from bifrost_sdk import Bifrost
 bf = Bifrost(
     "http://gateway:8080/v1",
     model="provider/model",
-    api_key=virtual_key,  # from your own settings; never printed, never a provider key
+    api_key=virtual_key,  # from your own settings; never printed
+    gateway="bifrost",
     timeout=30.0,
     max_retries=3,
 )
@@ -21,18 +24,21 @@ bf = Bifrost(
 
 | Argument | Default | Automatic? | What it does | Example |
 |---|---|---|---|---|
-| `base_url` | required | no | The gateway's inference endpoint. `/mcp` and `/api/*` are derived from its origin. | `"http://gateway:8080/v1"` |
-| `model` | `None` | no | Default model, as the gateway names it (`provider/model`). Every verb takes `model=` to override it; a call with neither raises `ValueError`. | `model="provider/model"` |
-| `api_key` | `None` | no | The gateway **virtual key**, sent as `Authorization: Bearer <key>` on `/v1` and `/mcp`. Never a provider key. | `api_key=settings.bifrost_virtual_key` |
+| `base_url` | required | no | The endpoint's OpenAI-compatible root. On Bifrost, `/mcp` and `/api/*` are derived from its origin. | `"http://gateway:8080/v1"` |
+| `model` | `None` | no | Default model, as the endpoint names it (`provider/model` on a gateway). Every verb takes `model=` to override it; a call with neither raises `ValueError`. | `model="provider/model"` |
+| `api_key` | `None` | no | A bearer key (`BearerAuth`): the provider's own key for its endpoint, or a Bifrost **virtual key** (also sent on `/mcp`). Not with `auth=`. | `api_key=settings.llm_api_key` |
+| `auth` | `None` (or `BearerAuth(api_key)`) | no | Any `httpx.Auth` for the requests: `GoogleAuth`, `AwsSigV4Auth`, or `auth_strategy(name, key)` by name (`bearer`, `google`, `aws`). Applied to the clients the SDK builds. | `auth=auth_strategy("google")` |
+| `gateway` | `"openai-compatible"` | yes | `"bifrost"` adds Bifrost's extras (MCP tools, `mcp_logs`, `bf.mcp`, `options=`, the deny-all MCP scope on completions); elsewhere they raise `BifrostOnlyError`. | `gateway="bifrost"` |
+| `profile` | `ModelProfile()`: a plain chat model | yes | What the default model accepts. `reasoning_output=True` or `temperature=False` sends `max_completion_tokens` and no `temperature`. | `profile=ModelProfile(reasoning_output=True)` |
 | `timeout` | `60.0` | yes | Seconds per request (read, write, waiting for a pooled connection). The connect timeout is `min(5.0, timeout)`. `complete(timeout=)` overrides it for one call. | `timeout=30.0` |
 | `max_retries` | `2` | yes | Retries after the first attempt, for `chat`, `json` and `complete` only. `0` disables retries. | `max_retries=0` |
 | `backoff_seconds` | `0.5` | yes | Base of the jittered exponential backoff when a failure carries no delay of its own: retry *n* waits a uniform draw from `[0, backoff_seconds * 2**n)`, capped at 30 s. | `backoff_seconds=1.0` |
 | `max_tokens` | `2048` | yes | Output budget `chat`, `json` and `stream` send when the call passes none. `complete` sends only what you pass. | `max_tokens=4096` |
 | `circuit_failure_threshold` | `5` | yes | Consecutive failed calls (transport failures and 5xx; never a 4xx or 429) that open the circuit breaker. `0` disables it. | `circuit_failure_threshold=0` |
 | `circuit_open_seconds` | `30.0` | yes | How long an open circuit fails calls without sending them. | `circuit_open_seconds=10` |
-| `admin_token` | the `api_key` | yes | Bearer token for `/api/*` (`bf.mcp`, `mcp_logs`). A gateway with admin auth on closes `/api` to a virtual key, so pass one there. | `admin_token=settings.bifrost_admin_token` |
+| `admin_token` | the `api_key` | yes | Bifrost only. Bearer token for `/api/*` (`bf.mcp`, `mcp_logs`). A gateway with admin auth on closes `/api` to a virtual key, so pass one there. | `admin_token=settings.bifrost_admin_token` |
 | `client` | a pooled `httpx.AsyncClient` | yes | Your own client for `/v1` and `/mcp` (a proxy, a custom transport). One you pass is not closed by `aclose()`. | `client=httpx.AsyncClient(base_url=..., transport=...)` |
-| `admin_client` | a pooled `httpx.AsyncClient` | yes | Your own client for `/api/*`. | `admin_client=...` |
+| `admin_client` | a pooled `httpx.AsyncClient` | yes | Bifrost only. Your own client for `/api/*`. | `admin_client=...` |
 
 `Bifrost` is an async context manager. Outside `async with`, call `await bf.aclose()`.
 
@@ -54,12 +60,12 @@ async with Admin("http://gateway:8080", token=admin_token) as admin:
 
 ## Per request: `Options`
 
-What the gateway does for one call (a stored prompt, the MCP scope of `execute_tool`, the
-session, spend attribution, no content logging, any other header) is an `Options` passed as
-`options=`. Unset fields send nothing. Every field and its header:
+On a Bifrost gateway, what it does for one call (a stored prompt, the MCP scope of
+`execute_tool`, the session, spend attribution, no content logging, any other header) is an
+`Options` passed as `options=`. Unset fields send nothing. Every field and its header:
 [api.md](api.md#per-request-options).
 
-Always sent, with no option to turn it off: the deny-all MCP scope on every completion
+Always sent to Bifrost, with no option to turn it off: the deny-all MCP scope on every completion
 (`NO_GATEWAY_TOOLS`, [ADR 0003](adr/0003-completions-never-get-gateway-tools.md)).
 
 ## Fixed in code
@@ -77,18 +83,20 @@ Pass your own `client=` for other connection limits.
 
 ## The names the other repos use
 
-The SDK reads none of these, but every Trellis repo that uses it reads the same two names and
+The SDK reads none of these, but every Trellis repo that uses it reads the same names and
 passes them in, and the live tests here read the first:
 
 | Variable | Read by | Passed as |
 |---|---|---|
-| `BIFROST_URL` | agent-harness, agent-memory-service, this repo's live tests | `base_url` (the `/v1` URL) |
-| `BIFROST_VIRTUAL_KEY` | agent-harness, agent-memory-service | `api_key` |
+| `LLM_BASE_URL` | agent-harness, agent-memory-service, this repo's live tests | `base_url` (the `/v1` URL) |
+| `LLM_API_KEY` | agent-harness, agent-memory-service | `api_key` (with `LLM_AUTH=bearer`) |
+| `LLM_GATEWAY` | agent-harness, agent-memory-service | `gateway` (`openai-compatible` or `bifrost`) |
+| `LLM_AUTH` | agent-harness, agent-memory-service | `auth=auth_strategy(LLM_AUTH, LLM_API_KEY)` (`bearer`, `google`, `aws`) |
 
 ## The live tests' variables
 
 Only `make test-live` (`pytest -m live`) reads these. A plain `make test` deselects the live
-tests, because `BIFROST_URL` is often set in a shell that did not mean to register clients on
+tests, because `LLM_BASE_URL` is often set in a shell that did not mean to register clients on
 that gateway.
 
 | Variable | Default | What it is |
@@ -96,9 +104,11 @@ that gateway.
 | `BIFROST_LIVE_GATEWAY_BIN` | unset | a `bifrost-http` binary: the tests start their own gateway from it (free port, own app directory, dashboard auth) and stop it afterwards |
 | `BIFROST_LIVE_GATEWAY_CONFIG` | unset: no providers | the `config.json` the started gateway's is derived from (its providers) |
 | `BIFROST_LIVE_GATEWAY_DIR` | pytest's temporary directory | where the started gateway's app directory is made |
-| `BIFROST_URL` | unset: the live tests skip, unless `BIFROST_LIVE_GATEWAY_BIN` is set | a running gateway's `/v1` URL; `BIFROST_LIVE_URL` is still read when it is unset |
+| `LLM_BASE_URL` | unset: the live tests skip, unless `BIFROST_LIVE_GATEWAY_BIN` is set | a running gateway's `/v1` URL |
 | `BIFROST_LIVE_ADMIN_USERNAME`, `BIFROST_LIVE_ADMIN_PASSWORD` | unset: the tests that register MCP servers skip | that running gateway's admin login (the gateway registers loopback MCP servers only for its admin) |
 | `BIFROST_LIVE_MODEL` | unset: the tests that complete skip | a `provider/model` the gateway serves |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` | unset: that provider's smoke test is not collected | the provider's key, for one completion through its OpenAI-compatible endpoint (`tests/test_live_providers.py`) |
+| `LLM_LIVE_OPENAI_MODEL`, `LLM_LIVE_ANTHROPIC_MODEL`, `LLM_LIVE_GEMINI_MODEL` | `gpt-4o-mini`, `claude-haiku-4-5`, `gemini-2.5-flash` | the model that smoke test asks |
 
 The examples read nothing: they run against an in-process fake gateway
 ([examples/](../examples/README.md)).

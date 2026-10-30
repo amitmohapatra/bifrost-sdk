@@ -1,14 +1,14 @@
 # Architecture
 
-How `bifrost-sdk` sits between the agent platform's services and a Bifrost gateway, what is
-inside it, and its key flows as sequence diagrams: a completion under a virtual key (and under
+How `bifrost-sdk` sits between the agent platform's services and a model endpoint (any
+OpenAI-compatible one, or a Bifrost gateway with its extras), what is inside it, and its key flows as sequence diagrams: a completion under a virtual key (and under
 the deny-all MCP scope), a stream, listing and running MCP tools, a Virtual MCP with a
 forwarded caller header, and stored prompts and skills. It is also the one home of the error
 vocabulary, the retry policy and the circuit breaker. Method-level reference is in
 [api.md](api.md); the decisions behind the design are the [ADRs](adr/README.md).
 
 Contents: [among the five Trellis repos](#among-the-five-trellis-repos) ·
-[where it sits](#where-it-sits) · [inside the package](#inside-the-package) ·
+[where it sits](#where-it-sits-a-bifrost-gateway) · [inside the package](#inside-the-package) ·
 [a chat completion](#a-chat-completion-with-a-virtual-key) ·
 [the deny-all MCP scope](#a-completion-never-gets-the-gateways-mcp-tools) ·
 [MCP tools](#listing-and-calling-mcp-tools) ·
@@ -19,21 +19,26 @@ Contents: [among the five Trellis repos](#among-the-five-trellis-repos) ·
 
 ## Among the five Trellis repos
 
-Trellis is five repos. This one is the platform's only way to a model or a gateway MCP tool:
+Trellis is five repos. This one is the platform's way to a model through any OpenAI-compatible
+endpoint, and its only way to a gateway MCP tool:
 
 | Repo | What it is | Relation to bifrost-sdk |
 |---|---|---|
 | [agent-harness](https://github.com/amitmohapatra/agent-harness) | runs your agent (any framework) with memory, runs, governance, tools and evals | imports it (`bifrost-sdk>=0.3`) for MCP tools, tool execution, MCP logs and completions |
-| [agent-memory-service](https://github.com/amitmohapatra/agent-memory-service) | memory, context and feedback for agents | imports a vendored copy (`bifrost-sdk>=0.2`) for its own model calls |
+| [agent-memory-service](https://github.com/amitmohapatra/agent-memory-service) | memory, context and feedback for agents | imports a vendored copy (`bifrost-sdk>=0.3`) for its own model calls |
 | [agent-runs](https://github.com/amitmohapatra/agent-runs) | durable runs, the inbox, schedules, workers, webhooks | none: runs make no model calls |
-| [agent-contracts](https://github.com/amitmohapatra/agent-contracts) | the shared records and ports | none either way; its `classify()` maps this SDK's exceptions by class name, and `AgentError.of` keeps their `retryable` |
-| **bifrost-sdk** (this repo) | the client for the Bifrost model and MCP gateway | — |
+| [agent-contracts](https://github.com/amitmohapatra/agent-contracts) | the shared records and ports | none either way; its `classify()` maps this SDK's exceptions by class name, and `AgentError.of` keeps their `retryable`. Its `Endpoint` and `ModelProfile` are mapped onto this SDK's arguments by the harness and the memory service |
+| **bifrost-sdk** (this repo) | an OpenAI-compatible client, with Bifrost extras (MCP tools, their log, administration) | — |
 
-The SDK reads no environment variable. The repos that use it read `BIFROST_URL` (the
-gateway's `/v1` URL) and `BIFROST_VIRTUAL_KEY` themselves and pass them to the constructor
+The SDK reads no environment variable. The repos that use it read `LLM_BASE_URL` (the
+endpoint's `/v1` URL), `LLM_API_KEY`, `LLM_GATEWAY` and `LLM_AUTH` themselves and pass them to
+the constructor
 ([configuration.md](configuration.md#the-names-the-other-repos-use)).
 
-## Where it sits
+## Where it sits (a Bifrost gateway)
+
+Pointed at any other OpenAI-compatible endpoint, the client is only the left half of this
+picture: completions and `ping` against `/v1`, with its own auth, and no `/mcp` or `/api`.
 
 The gateway owns every credential and every policy: provider keys, virtual keys with their
 model and MCP allow-lists, budgets, routing rules, stored prompts. The SDK owns none of them.
@@ -93,7 +98,9 @@ Who imports it, and how:
 ```mermaid
 flowchart TB
     init["bifrost_sdk/__init__.py<br/>public names (__all__)"]
-    client["_client.py<br/>Bifrost, Messages"]
+    client["_client.py<br/>Bifrost, Messages, Gateway"]
+    auth["auth.py<br/>BearerAuth · GoogleAuth · AwsSigV4Auth<br/>AUTH_STRATEGIES · auth_strategy()"]
+    profile["_profile.py<br/>ModelProfile"]
     mcp["_mcp.py<br/>MCP resource · MCPClient · MCPClientConfig<br/>MCPConnection · ToolDef · ToolAnnotations · MCPLog<br/>tools/list and Code Mode parsing · scope()"]
     headers["headers.py<br/>Options · x-bf-* constants"]
     api["_api.py<br/>ManagementAPI (JSON over /api) · Resource<br/>management_client · origin<br/>limits() · timeouts()"]
@@ -107,7 +114,10 @@ flowchart TB
     init --> headers
     init --> errors
     init --> retry
+    init --> auth
     client --> mcp
+    client --> auth
+    client --> profile
     client --> headers
     client --> api
     client --> breaker
@@ -121,9 +131,11 @@ flowchart TB
     errors --> retry
 ```
 
-- `Bifrost` holds two httpx clients: one rooted at `base_url` (`/v1`, plus `/mcp` on the
-  same origin) that carries the virtual key, and one rooted at the origin for `/api/*` that
-  carries the admin token. `Admin` holds only the second kind. Every client the package
+- `Bifrost` holds one httpx client rooted at `base_url` (`/v1`, plus `/mcp` on the same
+  origin) that carries its `auth` (`api_key` as a `BearerAuth`, a `GoogleAuth`, an
+  `AwsSigV4Auth`), and with `gateway="bifrost"` a second, rooted at the origin for `/api/*`,
+  that carries the admin token. Its `profile` decides the shape of every completion body:
+  `max_completion_tokens` and no `temperature` for a model that reasons or takes none. `Admin` holds only the second kind. Every client the package
   builds gets `_api.limits()` (at most 100 connections, 20 idle kept for 30 s) and
   `_api.timeouts()` (connect `min(5, timeout)`; read, write and pool `timeout`).
 - Everything under `/api/*` goes through `ManagementAPI`: one request, no retries, the shared
@@ -432,6 +444,7 @@ classDiagram
     BifrostError <|-- CircuitOpen
     BifrostError <|-- EmptyResponse
     BifrostError <|-- InvalidJSON
+    BifrostError <|-- BifrostOnlyError
     GatewayError <|-- BadRequestError : 400
     GatewayError <|-- AuthenticationError : 401
     GatewayError <|-- PermissionDeniedError : 403
@@ -447,8 +460,12 @@ subclasses, so `except GatewayError` still catches every one of them.
 Every error carries `retryable`: whether the *same* call may succeed if made again later.
 It is `True` for `Unreachable`, `RateLimited`, `CircuitOpen`, and for a `GatewayError` whose
 status is in `RETRYABLE` (`408, 409, 425, 500, 502, 503, 504`); `False` for everything else —
-including a `501`, a `GatewayError` without a status, `EmptyResponse` and `InvalidJSON`.
-Callers above this client read it rather than re-deriving the rule.
+including a `501`, a `GatewayError` without a status, `EmptyResponse`, `InvalidJSON` and
+`BifrostOnlyError`. Callers above this client read it rather than re-deriving the rule.
+
+`BifrostOnlyError` is raised before anything is sent, by `tools`, `execute_tool`,
+`mcp_logs`, `bf.mcp`, any verb given `options=`, and the constructor given `admin_token` or
+`admin_client`, on a client whose `gateway` is not `"bifrost"`.
 
 | Raised by | `Unreachable` | `RateLimited` | `GatewayError` | `CircuitOpen` | `EmptyResponse` | `InvalidJSON` |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -557,13 +574,20 @@ stateDiagram-v2
 
 ## Design decisions
 
-The three that shape the rest have ADRs: [0001](adr/0001-constructor-arguments-only.md) (no
+The four that shape the rest have ADRs: [0001](adr/0001-constructor-arguments-only.md) (no
 environment reading), [0002](adr/0002-retries-and-the-circuit-breaker.md) (what is retried
-and what trips the breaker) and [0003](adr/0003-completions-never-get-gateway-tools.md) (the
-deny-all MCP scope on every completion).
+and what trips the breaker), [0003](adr/0003-completions-never-get-gateway-tools.md) (the
+deny-all MCP scope on every Bifrost completion) and
+[0004](adr/0004-openai-compatible-with-bifrost-extras.md) (any OpenAI-compatible endpoint:
+auth strategies, profiles, Bifrost-only methods).
 
-- **The gateway holds the credentials.** The SDK sends a virtual key, never a provider key,
-  and imports no provider SDK; changing provider is changing a model string.
+- **Data, not names.** Which body a model gets comes from its `ModelProfile`, how a request
+  authenticates from an `httpx.Auth` picked by name, and which extras exist from `gateway`:
+  no model-name or provider checks.
+
+- **No provider SDK.** The SDK sends a bearer key, a Google token or a SigV4 signature, and
+  imports no provider SDK; changing provider is changing a URL and a model string. Behind
+  Bifrost the gateway holds the provider keys and the client sends a virtual key.
 - **A 429 is not a failure.** `RateLimited` (and `RateLimitedError`) is not a `GatewayError`
   and never trips the breaker; its delay comes from `Retry-After` or from the body, where
   some providers put it.
