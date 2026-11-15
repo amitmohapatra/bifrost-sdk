@@ -19,3 +19,9 @@ htmlcov/
 !.env.example
 secrets*
 *.pem
+
+# stray files: merge leftovers, agent worktrees, local agent settings
+*.orig
+*.rej
+.claude/worktrees/
+.claude/settings.local.json
