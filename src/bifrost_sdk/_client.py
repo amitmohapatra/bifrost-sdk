@@ -41,6 +41,7 @@ from bifrost_sdk._errors import (
     EmptyResponse,
     GatewayError,
     InvalidJSON,
+    excerpt,
     from_response,
     unreachable,
 )
@@ -391,7 +392,7 @@ class Bifrost:
         params = {"name": name, "arguments": arguments}
         result = await self._rpc("tools/call", params, endpoint=endpoint)
         if result.get("isError"):
-            raise GatewayError(f"{name} failed", body=str(result.get("content"))[:300])
+            raise GatewayError(f"{name} failed", body=excerpt(str(result.get("content"))))
         return _text(result)
 
     async def _rpc(
@@ -413,7 +414,7 @@ class Bifrost:
             raise GatewayError(f"MCP {method} returned a non-JSON body") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
             error = payload.get("error") if isinstance(payload, dict) else None
-            raise GatewayError(f"MCP {method} failed: {error}", body=response.text[:300])
+            raise GatewayError(f"MCP {method} failed: {error}", body=excerpt(response.text))
         return payload["result"]
 
     async def mcp_logs(
@@ -635,7 +636,7 @@ class Bifrost:
         try:
             choice = payload["choices"][0]
         except (KeyError, IndexError, TypeError) as exc:
-            raise GatewayError("gateway returned no choices", body=str(payload)[:300]) from exc
+            raise GatewayError("gateway returned no choices", body=excerpt(str(payload))) from exc
         content = (choice.get("message") or {}).get("content")
         if isinstance(content, list):  # some gateways answer with content parts
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
@@ -683,13 +684,13 @@ def _parse_json(text: str) -> dict[str, Any]:
     except ValueError:
         start, end = stripped.find("{"), stripped.rfind("}")
         if start < 0 or end <= start:
-            raise InvalidJSON("response is not JSON", body=text[:300]) from None
+            raise InvalidJSON("response is not JSON", body=excerpt(text)) from None
         try:
             parsed = jsonlib.loads(stripped[start : end + 1])
         except ValueError:
-            raise InvalidJSON("response is not JSON", body=text[:300]) from None
+            raise InvalidJSON("response is not JSON", body=excerpt(text)) from None
     if not isinstance(parsed, dict):
-        raise InvalidJSON("response is not a JSON object", body=text[:300])
+        raise InvalidJSON("response is not a JSON object", body=excerpt(text))
     return parsed
 
 
@@ -698,9 +699,11 @@ def _json_object(response: httpx.Response, what: str) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise GatewayError(f"{what} returned a non-JSON body", body=response.text[:300]) from exc
+        raise GatewayError(f"{what} returned a non-JSON body", body=excerpt(response.text)) from exc
     if not isinstance(payload, dict):
-        raise GatewayError(f"{what} returned JSON that is not an object", body=response.text[:300])
+        raise GatewayError(
+            f"{what} returned JSON that is not an object", body=excerpt(response.text)
+        )
     return payload
 
 
@@ -719,7 +722,7 @@ def _delta(data: str) -> str:
         return ""
     choices = chunk.get("choices")
     if not choices and chunk.get("error"):
-        raise GatewayError("gateway reported an error mid-stream", body=data[:300])
+        raise GatewayError("gateway reported an error mid-stream", body=excerpt(data))
     first = choices[0] if isinstance(choices, list) and choices else None
     delta = first.get("delta") if isinstance(first, dict) else None
     return str(delta.get("content") or "") if isinstance(delta, dict) else ""

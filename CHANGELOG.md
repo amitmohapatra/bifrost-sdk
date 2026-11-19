@@ -6,6 +6,8 @@ go with which is in [docs/versioning.md](docs/versioning.md); the reasons are in
 
 ## Unreleased
 
+* The part of an error body an exception carries is the same length everywhere (500
+  characters, `_errors.excerpt`): MCP, non-JSON and mid-stream errors carried 300.
 * `NO_GATEWAY_TOOLS` is exported from `bifrost_sdk` and `bifrost_sdk.headers`, so a
   framework's own model client pointed at the gateway sends the same deny-all scope.
 * Documentation: a "Start here" README; the method reference moved to

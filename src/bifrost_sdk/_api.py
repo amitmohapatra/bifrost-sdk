@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from bifrost_sdk._errors import ERROR_STATUS, GatewayError, from_response, unreachable
+from bifrost_sdk._errors import ERROR_STATUS, GatewayError, excerpt, from_response, unreachable
 
 #: Connect timeout ceiling: a gateway that does not accept a connection in this long is down.
 CONNECT_TIMEOUT = 5.0
@@ -81,7 +81,7 @@ class ManagementAPI:
         except ValueError as exc:
             # The gateway's UI catch-all answers unknown /api paths with 200 and HTML.
             raise GatewayError(
-                f"{method} {path} returned a non-JSON body", body=response.text[:300]
+                f"{method} {path} returned a non-JSON body", body=excerpt(response.text)
             ) from exc
 
     async def content(self, path: str) -> bytes:

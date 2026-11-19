@@ -23,6 +23,12 @@ _RATE_LIMITED = 429
 _BODY_EXCERPT = 500
 
 
+def excerpt(body: str) -> str:
+    """The part of an error body an exception carries (its first :data:`_BODY_EXCERPT`
+    characters)."""
+    return body[:_BODY_EXCERPT]
+
+
 class BifrostError(Exception):
     """Base class. ``details`` carries whatever the gateway said, for logs and tests."""
 
@@ -175,14 +181,14 @@ def from_response(response: httpx.Response) -> RateLimitedError | GatewayError:
     "Please retry in 28.9s." at index 483 of 751, so truncating before parsing lost the delay.
     """
     body = response.text
-    excerpt = body[:_BODY_EXCERPT]
+    carried = excerpt(body)
     status = response.status_code
     if status == _RATE_LIMITED:
         return RateLimitedError(
             "gateway rate limited the request",
             retry_after=retry_after(response.headers, body),
             status=_RATE_LIMITED,
-            body=excerpt,
+            body=carried,
         )
     kind = ServerError if status >= SERVER_ERROR else _BY_STATUS.get(status, GatewayError)
-    return kind(f"gateway returned {status}", status=status, body=excerpt)
+    return kind(f"gateway returned {status}", status=status, body=carried)
